@@ -1,0 +1,17 @@
+defaults:
+  - default
+
+model:
+  _target_: models.simple_lstm.SimpleLSTM
+  _partial_: true
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+
+trade_loss:
+  _target_: loss.binary_focal_loss.BinaryFocalLoss
+  alpha: 0.75
+  gamma: 2.0
+  reduction: "mean"
+
+learning_rate: 1e-2

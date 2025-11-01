@@ -1,0 +1,12 @@
+torch
+lightning
+torchmetrics
+
+hydra-core
+hydra-colorlog
+hydra-optuna-sweeper
+
+wandb
+
+rich
+pytest

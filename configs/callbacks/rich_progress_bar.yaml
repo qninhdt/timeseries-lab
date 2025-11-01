@@ -1,0 +1,9 @@
+rich_progress_bar:
+  _target_: lightning.pytorch.callbacks.RichProgressBar
+  theme:
+    _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
+    metrics: "#f39c12"
+    time: "#e67e22"
+    metrics_text_delimiter: "\n| "
+    description: "#e67e22"
+    metrics_format: ".4f"
