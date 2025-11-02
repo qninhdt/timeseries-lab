@@ -31,7 +31,6 @@ from utils import (
 log = RankedLogger(__name__, rank_zero_only=True)
 
 torch.set_float32_matmul_precision("high")
-torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
 @task_wrapper
