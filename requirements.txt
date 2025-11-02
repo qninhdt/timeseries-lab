@@ -4,7 +4,7 @@ torchmetrics
 bottleneck
 torchinfo
 ta-lib
-pandas-ta
+pandas_ta
 pandas
 
 hydra-core
