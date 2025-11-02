@@ -6,7 +6,7 @@ model:
   _partial_: true
   hidden_size: 64
   num_layers: 2
-  dropout: 0.1
+  dropout: 0.2
 
 trade_loss:
   _target_: loss.binary_focal_loss.BinaryFocalLoss
