@@ -3,9 +3,7 @@ lightning
 torchmetrics
 bottleneck
 torchinfo
-ta-lib
-pandas-ta
-pandas
+freqtrade
 
 hydra-core
 hydra-colorlog
