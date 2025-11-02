@@ -9,5 +9,3 @@ model:
   num_layers: 4
   dim_feedforward: 256
   dropout: 0.1
-
-learning_rate: 1e-3

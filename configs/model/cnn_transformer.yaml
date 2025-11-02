@@ -1,0 +1,15 @@
+defaults:
+  - default
+
+model:
+  _target_: models.cnn_transformer.CNNTransformer
+  _partial_: true
+  d_model: 64
+  nhead: 4
+  num_layers: 4
+  dim_feedforward: 256
+  dropout: 0.1
+  # CNN backbone parameters
+  cnn_n_blocks: [1, 1]
+  cnn_planes_per_branch: [32, 64]
+  cnn_target_planes: [32, 64]
