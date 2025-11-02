@@ -68,7 +68,7 @@ FEATURE_CONFIG = {
     "low": {"norm": "close"},
     "close": {"norm": "close"},
     "sar": {"norm": "close"},
-    "vwap": {"norm": "close"},
+    # "vwap": {"norm": "close"},
     "bb_upper": {"norm": "close"},
     "bb_middle": {"norm": "close"},
     "bb_lower": {"norm": "close"},
@@ -465,10 +465,10 @@ class CryptoDataModule(LightningDataModule):
             df_temp["volume"],
             length=20,
         ).values
-        vwap = pta.vwap(
-            df_temp["high"], df_temp["low"], df_temp["close"], df_temp["volume"]
-        )
-        cols["vwap"] = vwap.values if vwap is not None else 0
+        # vwap = pta.vwap(
+        #     df_temp["high"], df_temp["low"], df_temp["close"], df_temp["volume"]
+        # )
+        # cols["vwap"] = vwap.values if vwap is not None else 0
 
         cols["macd"], cols["macd_signal"], cols["macd_hist"] = talib.MACD(close_p)
         # cols["ema_20"] = talib.EMA(close_p, timeperiod=20)
