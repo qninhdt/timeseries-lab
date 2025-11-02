@@ -223,17 +223,7 @@ class CryptoDataModule(LightningDataModule):
         self.clip_only_indices = np.array(self.clip_only_indices, dtype=np.intp)
 
     def prepare_data(self):
-        """
-        Loads metadata. This runs on only one process.
-        """
-        metadata_path = self.data_dir / "metadata.json"
-        if not metadata_path.exists():
-            raise FileNotFoundError(f"metadata.json not found in {self.data_dir}")
-
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-            self.coins = list(metadata["coins"].keys())
-            print(f"Loaded {len(self.coins)} coins from metadata.")
+        pass
 
     def setup(self, stage: Optional[str] = None):
         """
@@ -250,6 +240,15 @@ class CryptoDataModule(LightningDataModule):
             return
 
         print(f"--- Starting setup for stage: {stage} ---")
+
+        metadata_path = self.data_dir / "metadata.json"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"metadata.json not found in {self.data_dir}")
+
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+            self.coins = list(metadata["coins"].keys())
+            print(f"Loaded {len(self.coins)} coins from metadata.")
 
         # Apply max_coins limit
         if self.hparams.max_coins > 0 and len(self.coins) > self.hparams.max_coins:
@@ -612,55 +611,133 @@ class CryptoDataModule(LightningDataModule):
         Sets validation coins based on the provided parameter or automatically
         selects the P coins with the longest history.
 
-        Validates that:
-        - If validation_coins is provided, it must have exactly portfolio_size coins
-        - All validation coins must exist in the loaded coins
-        - All validation coins must have valid data at all validation timestamps
+        If validation_coins is provided:
+        - Filters out non-existent coins (with warning)
+        - If insufficient coins (< portfolio_size), automatically fills with best available coins
+        - If excess coins (> portfolio_size), keeps only portfolio_size coins
+        - Validates that final coins have valid data at all validation timestamps
         """
         validation_coins = self.hparams.validation_coins
 
         if validation_coins is not None:
-            # Validate that the number of coins matches portfolio_size
-            if len(validation_coins) != self.hparams.portfolio_size:
-                raise ValueError(
-                    f"validation_coins must have exactly {self.hparams.portfolio_size} coins, "
-                    f"but got {len(validation_coins)} coins: {validation_coins}"
-                )
-
-            # Validate that all coins exist in the loaded coins list
+            # Filter out non-existent coins
             coins_set = set(self.coins)
+            existing_coins = [coin for coin in validation_coins if coin in coins_set]
             missing_coins = [coin for coin in validation_coins if coin not in coins_set]
+
             if missing_coins:
-                raise ValueError(
-                    f"The following validation coins do not exist in the dataset: {missing_coins}"
+                warnings.warn(
+                    f"The following validation coins do not exist in the dataset and will be ignored: {missing_coins}",
+                    UserWarning,
                 )
 
-            # Convert coin names to indices
             coin_to_idx = {coin: idx for idx, coin in enumerate(self.coins)}
-            val_coin_indices = np.array(
-                [coin_to_idx[coin] for coin in validation_coins]
-            )
-            val_coin_indices = np.sort(val_coin_indices)
+            selected_indices = []
 
-            # Validate that all validation coins have valid data at all validation timestamps
+            # Add existing coins from validation_coins
+            for coin in existing_coins:
+                selected_indices.append(coin_to_idx[coin])
+
+            # Remove duplicates while preserving order
+            seen = set()
+            selected_indices = [
+                idx for idx in selected_indices if not (idx in seen or seen.add(idx))
+            ]
+
+            # Filter out coins that don't have valid data at validation timestamps
             if len(self.val_indices) > 0:
-                # Check if all validation coins are valid at all validation timestamps
-                for ts_idx in self.val_indices:
-                    invalid_coins = []
-                    for coin_idx in val_coin_indices:
-                        if not self.mask_aligned[coin_idx, ts_idx]:
-                            coin_name = self.coins[coin_idx]
-                            invalid_coins.append(coin_name)
-
-                    if invalid_coins:
-                        ts_date = pd.to_datetime(self.master_timestamps[ts_idx])
-                        raise ValueError(
-                            f"The following validation coins do not have valid data "
-                            f"at timestamp {ts_date} (index {ts_idx}): {invalid_coins}"
+                valid_at_val_indices = []
+                for coin_idx in selected_indices:
+                    # Check if coin is valid at all validation timestamps
+                    is_valid = np.all(self.mask_aligned[coin_idx, self.val_indices])
+                    if is_valid:
+                        valid_at_val_indices.append(coin_idx)
+                    else:
+                        coin_name = self.coins[coin_idx]
+                        warnings.warn(
+                            f"Validation coin '{coin_name}' does not have valid data at all validation timestamps and will be ignored",
+                            UserWarning,
                         )
+                selected_indices = valid_at_val_indices
 
-            self.val_coin_indices = val_coin_indices
+            # If we need more coins, fill with best available coins
+            if len(selected_indices) < self.hparams.portfolio_size:
+                needed = self.hparams.portfolio_size - len(selected_indices)
+
+                # Calculate score for each coin: number of valid samples at validation timestamps
+                candidate_scores = {}
+                for coin_idx in range(len(self.coins)):
+                    if coin_idx in selected_indices:
+                        continue  # Skip already selected coins
+
+                    # Only consider coins that are valid at all validation timestamps
+                    if len(self.val_indices) > 0:
+                        is_valid = np.all(self.mask_aligned[coin_idx, self.val_indices])
+                        if not is_valid:
+                            continue  # Skip coins without valid data at all validation timestamps
+                        # Score based on valid samples at validation timestamps
+                        score = np.sum(self.mask_aligned[coin_idx, self.val_indices])
+                        candidate_scores[coin_idx] = score
+                    else:
+                        # Fallback to total valid samples
+                        score = np.sum(self.mask_aligned[coin_idx, :])
+                        candidate_scores[coin_idx] = score
+
+                # Sort by score and take top needed coins
+                sorted_candidates = sorted(
+                    candidate_scores.items(), key=lambda x: x[1], reverse=True
+                )
+
+                added_count = 0
+                for coin_idx, score in sorted_candidates:
+                    if added_count >= needed:
+                        break
+                    selected_indices.append(coin_idx)
+                    coin_name = self.coins[coin_idx]
+                    print(f"Auto-added validation coin '{coin_name}' (score: {score})")
+                    added_count += 1
+
+                # If still not enough coins, warn and use what we have
+                if len(selected_indices) < self.hparams.portfolio_size:
+                    warnings.warn(
+                        f"Only {len(selected_indices)} valid coins available for validation portfolio "
+                        f"(requested {self.hparams.portfolio_size}). Using available coins.",
+                        UserWarning,
+                    )
+
+            # If we have too many coins, keep only portfolio_size best ones
+            elif len(selected_indices) > self.hparams.portfolio_size:
+                # Score coins based on valid samples at validation timestamps
+                coin_scores = []
+                for coin_idx in selected_indices:
+                    if len(self.val_indices) > 0:
+                        score = np.sum(self.mask_aligned[coin_idx, self.val_indices])
+                    else:
+                        score = np.sum(self.mask_aligned[coin_idx, :])
+                    coin_scores.append((coin_idx, score))
+
+                # Sort by score and keep top portfolio_size
+                coin_scores.sort(key=lambda x: x[1], reverse=True)
+                selected_indices = [
+                    idx for idx, _ in coin_scores[: self.hparams.portfolio_size]
+                ]
+
+                removed_coins = [
+                    self.coins[idx]
+                    for idx, _ in coin_scores[self.hparams.portfolio_size :]
+                ]
+                warnings.warn(
+                    f"Too many validation coins provided. Keeping top {self.hparams.portfolio_size} coins. "
+                    f"Removed: {removed_coins}",
+                    UserWarning,
+                )
+
+            self.val_coin_indices = np.sort(np.array(selected_indices))
             self.val_coin_names = [self.coins[i] for i in self.val_coin_indices]
+
+            print(
+                f"Final validation coins (P={len(self.val_coin_indices)}): {self.val_coin_names}"
+            )
         else:
             # Fallback to automatic selection (original behavior)
             valid_samples_per_coin = np.sum(self.mask_aligned, axis=1)
