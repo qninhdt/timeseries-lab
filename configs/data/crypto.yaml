@@ -6,7 +6,7 @@ barrier_up: 0.02
 barrier_down: 0.02
 barrier_horizon: 4
 lookback_window: 64
-candle_length: 60000
+candle_length: 50000
 portfolio_size: 64
 max_coins: 256
 batch_size: 32
