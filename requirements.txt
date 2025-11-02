@@ -1,6 +1,7 @@
 # torch
 lightning
 torchmetrics
+torchvision
 bottleneck
 torchinfo
 freqtrade
