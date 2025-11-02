@@ -127,7 +127,7 @@ class CryptoDataModule(LightningDataModule):
 
     def __init__(
         self,
-        data_dir: str = "./data/crypto-700",
+        data_dir: str = "./data/crypto-1200",
         end_date: str = "2025-09-29",
         validation_start_date: str = "2025-06-01",
         candle_length: int = 40000,
@@ -139,6 +139,7 @@ class CryptoDataModule(LightningDataModule):
         batch_size: int = 4,
         num_workers: int = 4,
         max_coins: int = -1,
+        validation_coins: Optional[List[str]] = None,
     ):
         """
         Initializes the DataModule.
@@ -157,6 +158,9 @@ class CryptoDataModule(LightningDataModule):
             batch_size (int): Number of samples per batch (B).
             num_workers (int): Number of parallel workers for data loading.
             max_coins (int): Maximum number of coins to process (-1 means all coins).
+            validation_coins (Optional[List[str]]): List of coin names to use for validation.
+                                                    Must have exactly `portfolio_size` coins.
+                                                    If None, automatically selects coins with longest history.
         """
         super().__init__()
         self.save_hyperparameters()
@@ -544,29 +548,40 @@ class CryptoDataModule(LightningDataModule):
         """
         Finds all timestamps that have at least `portfolio_size` valid coins.
         Splits these valid timestamps into train and validation sets.
-        """
-        valid_coins_per_timestamp = np.sum(self.mask_aligned, axis=0)
-        valid_sample_mask = valid_coins_per_timestamp >= self.hparams.portfolio_size
-        valid_sample_indices = np.where(valid_sample_mask)[0]
 
-        if len(valid_sample_indices) == 0:
+        Applies oversampling to train timestamps based on coin availability
+        as per the user's request.
+        """
+        # Tính toán số lượng coin hợp lệ cho mỗi timestamp
+        valid_coins_per_timestamp = np.sum(self.mask_aligned, axis=0)
+
+        # Tìm các timestamp có đủ coin (>= portfolio_size)
+        valid_sample_mask = valid_coins_per_timestamp >= self.hparams.portfolio_size
+        all_valid_sample_indices = np.where(valid_sample_mask)[0]
+
+        if len(all_valid_sample_indices) == 0:
             raise ValueError(
                 f"No timestamps found with at least {self.hparams.portfolio_size} valid coins."
             )
 
+        # Xác định chỉ số bắt đầu của tập validation
         val_start_idx = np.searchsorted(
             self.master_timestamps,
             np.datetime64(self.validation_start_date),
             side="left",
         )
 
-        val_mask = valid_sample_indices >= val_start_idx
+        # Chia các chỉ số (indices) *duy nhất* thành train và val
+        val_mask = all_valid_sample_indices >= val_start_idx
         train_mask = ~val_mask
 
-        self.train_indices = valid_sample_indices[train_mask]
-        self.val_indices = valid_sample_indices[val_mask]
+        unique_train_indices = all_valid_sample_indices[train_mask]
+        self.val_indices = all_valid_sample_indices[
+            val_mask
+        ]  # Val indices giữ nguyên, không lặp lại
 
-        if len(self.train_indices) == 0:
+        # Kiểm tra xem có sample nào không
+        if len(unique_train_indices) == 0:
             raise ValueError(
                 "No training samples found. Adjust `validation_start_date`."
             )
@@ -575,17 +590,85 @@ class CryptoDataModule(LightningDataModule):
                 "No validation samples found. Adjust `validation_start_date`."
             )
 
+        # --- BẮT ĐẦU THAY ĐỔI ---
+        # Áp dụng oversampling cho train_indices theo công thức
+
+        # 1. Lấy số lượng coin hợp lệ cho từng timestamp trong tập train
+        n_valid_coins_at_train_indices = valid_coins_per_timestamp[unique_train_indices]
+
+        # 2. Tính số lần lặp lại cho mỗi timestamp
+        n_repeats = np.ceil(
+            n_valid_coins_at_train_indices / self.hparams.portfolio_size
+        ).astype(np.intp)
+
+        # Đảm bảo số lần lặp lại ít nhất là 1
+        n_repeats = np.maximum(n_repeats, 1).astype(np.intp)
+
+        # 3. Tạo ra mảng train_indices mới đã được lặp lại
+        self.train_indices = np.repeat(unique_train_indices, n_repeats)
+
     def _find_validation_coins(self):
         """
-        Finds the P coins with the longest history to use as the
-        fixed validation set.
+        Sets validation coins based on the provided parameter or automatically
+        selects the P coins with the longest history.
+
+        Validates that:
+        - If validation_coins is provided, it must have exactly portfolio_size coins
+        - All validation coins must exist in the loaded coins
+        - All validation coins must have valid data at all validation timestamps
         """
-        valid_samples_per_coin = np.sum(self.mask_aligned, axis=1)
-        top_p_coin_indices = np.argsort(valid_samples_per_coin)[
-            -self.hparams.portfolio_size :
-        ]
-        self.val_coin_indices = np.sort(top_p_coin_indices)
-        self.val_coin_names = [self.coins[i] for i in self.val_coin_indices]
+        validation_coins = self.hparams.validation_coins
+
+        if validation_coins is not None:
+            # Validate that the number of coins matches portfolio_size
+            if len(validation_coins) != self.hparams.portfolio_size:
+                raise ValueError(
+                    f"validation_coins must have exactly {self.hparams.portfolio_size} coins, "
+                    f"but got {len(validation_coins)} coins: {validation_coins}"
+                )
+
+            # Validate that all coins exist in the loaded coins list
+            coins_set = set(self.coins)
+            missing_coins = [coin for coin in validation_coins if coin not in coins_set]
+            if missing_coins:
+                raise ValueError(
+                    f"The following validation coins do not exist in the dataset: {missing_coins}"
+                )
+
+            # Convert coin names to indices
+            coin_to_idx = {coin: idx for idx, coin in enumerate(self.coins)}
+            val_coin_indices = np.array(
+                [coin_to_idx[coin] for coin in validation_coins]
+            )
+            val_coin_indices = np.sort(val_coin_indices)
+
+            # Validate that all validation coins have valid data at all validation timestamps
+            if len(self.val_indices) > 0:
+                # Check if all validation coins are valid at all validation timestamps
+                for ts_idx in self.val_indices:
+                    invalid_coins = []
+                    for coin_idx in val_coin_indices:
+                        if not self.mask_aligned[coin_idx, ts_idx]:
+                            coin_name = self.coins[coin_idx]
+                            invalid_coins.append(coin_name)
+
+                    if invalid_coins:
+                        ts_date = pd.to_datetime(self.master_timestamps[ts_idx])
+                        raise ValueError(
+                            f"The following validation coins do not have valid data "
+                            f"at timestamp {ts_date} (index {ts_idx}): {invalid_coins}"
+                        )
+
+            self.val_coin_indices = val_coin_indices
+            self.val_coin_names = [self.coins[i] for i in self.val_coin_indices]
+        else:
+            # Fallback to automatic selection (original behavior)
+            valid_samples_per_coin = np.sum(self.mask_aligned, axis=1)
+            top_p_coin_indices = np.argsort(valid_samples_per_coin)[
+                -self.hparams.portfolio_size :
+            ]
+            self.val_coin_indices = np.sort(top_p_coin_indices)
+            self.val_coin_names = [self.coins[i] for i in self.val_coin_indices]
 
     def _normalize_batch(self, features_batch: np.ndarray, stats_batch: np.ndarray):
         """
@@ -632,16 +715,11 @@ class CryptoDataModule(LightningDataModule):
                     coin_indices.sort()
                 else:
                     coin_indices = self.val_coin_indices
+
                     if not np.all(self.mask_aligned[coin_indices, ts_idx]):
-                        valid_coin_indices_at_time = np.where(
-                            self.mask_aligned[:, ts_idx]
-                        )[0]
-                        coin_indices = np.random.choice(
-                            valid_coin_indices_at_time,
-                            self.hparams.portfolio_size,
-                            replace=False,
+                        raise ValueError(
+                            f"No valid coins at time {ts_idx} for validation"
                         )
-                        coin_indices.sort()
 
                 features_slice = self.all_features_aligned[
                     coin_indices, (ts_idx - T + 1) : (ts_idx + 1), :
@@ -696,4 +774,16 @@ class CryptoDataModule(LightningDataModule):
             pin_memory=True,
             drop_last=True,
             collate_fn=self._create_collator(is_train=False),
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        """Creates the test DataLoader."""
+        dataset = CryptoPortfolioDataset(self.test_indices)
+        return DataLoader(
+            dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=False,
+            num_workers=self.hparams.num_workers,
+            pin_memory=True,
+            drop_last=True,
         )

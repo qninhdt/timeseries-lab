@@ -79,7 +79,7 @@ class TraderLitModule(LightningModule):
         loss = self.trade_loss(logits, targets.float())
 
         # Get probabilities for metrics
-        preds = torch.sigmoid(logits)
+        preds = (torch.sigmoid(logits) > 0.5).float()
 
         return loss, preds, targets
 

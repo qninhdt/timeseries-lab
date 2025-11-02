@@ -1,15 +1,15 @@
 task_name: train
 tags:
-- dev
+  - dev
 train: true
 test: true
 ckpt_path: null
 seed: 24
 data:
   _target_: crypto_datamodule.CryptoDataModule
-  data_dir: ${paths.data_dir}/crypto-700
-  end_date: '2025-09-29'
-  validation_start_date: '2025-06-01'
+  data_dir: ${paths.data_dir}/crypto-1200
+  end_date: "2025-09-29"
+  validation_start_date: "2025-06-01"
   barrier_up: 0.02
   barrier_down: 0.02
   barrier_horizon: 4
@@ -75,12 +75,12 @@ callbacks:
     _target_: lightning.pytorch.callbacks.RichProgressBar
     theme:
       _target_: lightning.pytorch.callbacks.progress.rich_progress.RichProgressBarTheme
-      metrics: '#f39c12'
-      time: '#e67e22'
-      metrics_text_delimiter: '
+      metrics: "#f39c12"
+      time: "#e67e22"
+      metrics_text_delimiter: "
 
-        | '
-      description: '#e67e22'
+        | "
+      description: "#e67e22"
 trainer:
   _target_: lightning.pytorch.trainer.Trainer
   default_root_dir: ${paths.output_dir}
