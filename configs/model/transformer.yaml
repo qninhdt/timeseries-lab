@@ -10,10 +10,4 @@ model:
   dim_feedforward: 256
   dropout: 0.1
 
-trade_loss:
-  _target_: loss.binary_focal_loss.BinaryFocalLoss
-  alpha: 0.5
-  gamma: 2.0
-  reduction: "mean"
-
 learning_rate: 1e-3

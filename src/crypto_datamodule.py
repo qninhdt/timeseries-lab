@@ -188,6 +188,10 @@ class CryptoDataModule(LightningDataModule):
         self.mask_aligned = None
         self.val_coin_indices = None
 
+        # --- Class Weights for BCE ---
+        self.class_weights = None
+        self.class_frequencies = None
+
     def _setup_feature_config(self):
         """
         Defines the feature configuration and creates all necessary
@@ -322,6 +326,9 @@ class CryptoDataModule(LightningDataModule):
 
         # --- 6. Identify validation coins ---
         self._find_validation_coins()
+
+        # --- 7. Calculate class frequencies and weights ---
+        self._calculate_class_weights()
 
         print(f"--- Setup complete ---")
         print(f"  Total valid train samples: {len(self.train_indices):,}")
@@ -746,6 +753,72 @@ class CryptoDataModule(LightningDataModule):
             ]
             self.val_coin_indices = np.sort(top_p_coin_indices)
             self.val_coin_names = [self.coins[i] for i in self.val_coin_indices]
+
+    def _calculate_class_weights(self):
+        """
+        Calculates class frequencies and weights for Binary Cross Entropy loss.
+        Weights are calculated from training data labels.
+        """
+        if len(self.train_indices) == 0:
+            # Default weights if no training data
+            self.class_frequencies = {"no_trade": 0.5, "trade": 0.5}
+            self.class_weights = torch.tensor([1.0, 1.0], dtype=torch.float32)
+            print("No training data available, using default class weights [1.0, 1.0]")
+            return
+
+        # Collect all labels from training data
+        # For each training timestamp, we need to consider all valid coins
+        all_labels = []
+
+        # Sample a subset of training indices for efficiency (if too many)
+        max_samples = min(100000, len(self.train_indices))
+        sample_indices = np.random.choice(
+            self.train_indices, size=max_samples, replace=False
+        )
+
+        for ts_idx in sample_indices:
+            # Get all valid coins at this timestamp
+            valid_coin_indices = np.where(self.mask_aligned[:, ts_idx])[0]
+
+            # Get labels for all valid coins
+            labels_at_time = self.all_labels_trade_aligned[valid_coin_indices, ts_idx]
+            all_labels.extend(labels_at_time.tolist())
+
+        # Convert to numpy array for easier counting
+        all_labels = np.array(all_labels, dtype=bool)
+
+        # Calculate frequencies
+        n_total = len(all_labels)
+        n_trade = np.sum(all_labels)  # Class 1 (trade=True)
+        n_no_trade = n_total - n_trade  # Class 0 (trade=False)
+
+        freq_trade = n_trade / n_total if n_total > 0 else 0.5
+        freq_no_trade = n_no_trade / n_total if n_total > 0 else 0.5
+
+        self.class_frequencies = {
+            "no_trade": freq_no_trade,
+            "trade": freq_trade,
+        }
+
+        # Calculate weights using balanced approach
+        # weight[i] = n_samples / (n_classes * n_class_i)
+        if n_trade > 0 and n_no_trade > 0:
+            weight_no_trade = n_total / (2.0 * n_no_trade)  # Weight for class 0
+            weight_trade = n_total / (2.0 * n_trade)  # Weight for class 1
+        else:
+            # If one class is missing, use equal weights
+            weight_no_trade = 1.0
+            weight_trade = 1.0
+
+        # Store as torch tensor [weight_class_0, weight_class_1]
+        self.class_weights = torch.tensor(
+            [weight_no_trade, weight_trade], dtype=torch.float32
+        )
+
+        print(f"Class frequencies calculated from {n_total:,} training samples:")
+        print(f"  No Trade (class 0): {freq_no_trade:.4f} ({n_no_trade:,} samples)")
+        print(f"  Trade (class 1): {freq_trade:.4f} ({n_trade:,} samples)")
+        print(f"  Class weights for BCE: [{weight_no_trade:.4f}, {weight_trade:.4f}]")
 
     def _normalize_batch(self, features_batch: np.ndarray, stats_batch: np.ndarray):
         """
