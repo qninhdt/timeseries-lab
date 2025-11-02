@@ -1,7 +1,7 @@
 torch
 lightning
 torchmetrics
-bottletneck
+bottleneck
 torchinfo
 ta-lib
 pandas-ta

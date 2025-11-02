@@ -5,7 +5,7 @@ model:
   _target_: models.simple_transformer.SimpleTransformer
   _partial_: true
   d_model: 64
-  nhead: 8
+  nhead: 4
   num_layers: 4
   dim_feedforward: 256
   dropout: 0.1
