@@ -192,6 +192,8 @@ class CryptoDataModule(LightningDataModule):
         self.class_weights = None
         self.class_frequencies = None
 
+        self.coin_baselines = {}
+
     def _setup_feature_config(self):
         """
         Defines the feature configuration and creates all necessary
@@ -252,6 +254,13 @@ class CryptoDataModule(LightningDataModule):
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
             self.coins = list(metadata["coins"].keys())
+
+            # sort coins by duration days
+            self.coins = sorted(
+                self.coins,
+                key=lambda x: metadata["coins"][x]["duration_days"],
+                reverse=True,
+            )
             print(f"Loaded {len(self.coins)} coins from metadata.")
 
         # Apply max_coins limit
@@ -329,6 +338,9 @@ class CryptoDataModule(LightningDataModule):
 
         # --- 7. Calculate class frequencies and weights ---
         self._calculate_class_weights()
+
+        # --- 8. Calculate coin baselines ---
+        self._calculate_coin_baselines()
 
         print(f"--- Setup complete ---")
         print(f"  Total valid train samples: {len(self.train_indices):,}")
@@ -549,6 +561,62 @@ class CryptoDataModule(LightningDataModule):
         )
         valid_lookback = history_counts == self.hparams.lookback_window
         self.mask_aligned = history_mask & valid_lookback
+
+    def _calculate_coin_baselines(self):
+        """
+        Calculates the positive rate (baseline AP) for each coin
+        using only valid training samples.
+        """
+        print("Calculating coin baselines from training data...")
+        if self.train_indices is None or len(self.train_indices) == 0:
+            print("No training indices found. Skipping baseline calculation.")
+            self.coin_baselines = {coin: 0.0 for coin in self.coins}
+            return
+
+        n_coins = len(self.coins)
+        n_timestamps = len(self.master_timestamps)
+
+        # 1. Lấy các chỉ số training duy nhất
+        unique_train_indices = np.unique(self.train_indices)
+
+        # 2. Tạo một mặt nạ cho biết đâu là sample training
+        # (T)
+        train_mask_full = np.zeros(n_timestamps, dtype=bool)
+        train_mask_full[unique_train_indices] = True
+
+        # 3. Kết hợp với mặt nạ hợp lệ (validity mask)
+        # (C, T) & (1, T) -> (C, T)
+        valid_train_mask = self.mask_aligned & train_mask_full[None, :]
+
+        # 4. Tính toán cho từng coin
+        # Lấy nhãn của các sample positive VÀ hợp lệ trong tập train
+        n_positive_trades = np.sum(
+            self.all_labels_trade_aligned & valid_train_mask, axis=1
+        )
+        # Lấy tổng số sample hợp lệ trong tập train
+        n_total_valid_samples = np.sum(valid_train_mask, axis=1)
+
+        # 5. Tính baseline (tỉ lệ positive), xử lý chia cho 0
+        baselines = np.divide(
+            n_positive_trades,
+            n_total_valid_samples,
+            out=np.full(n_coins, np.nan),  # Trả về NaN nếu không có sample
+            where=n_total_valid_samples > 0,
+        )
+
+        # 6. Lưu trữ vào dictionary
+        self.coin_baselines = {
+            self.coins[i]: (baselines[i] if not np.isnan(baselines[i]) else 0.0)
+            for i in range(n_coins)
+        }
+
+        # In ra một vài ví dụ
+        print("Coin baselines calculated (sample):")
+        if self.val_coin_names:
+            for i, coin in enumerate(self.val_coin_names[:5]):
+                print(f"  {coin}: {self.coin_baselines.get(coin, 0.0):.4f}")
+        else:
+            print(" (No val_coin_names to display sample)")
 
     def _find_samples_and_split(self):
         """

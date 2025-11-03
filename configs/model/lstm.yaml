@@ -4,6 +4,7 @@ defaults:
 model:
   _target_: models.simple_lstm.SimpleLSTM
   _partial_: true
-  hidden_size: 64
+  hidden_size: 128
   num_layers: 4
-  dropout: 0.1
+  dropout: 0.2
+# use_focal_loss: true

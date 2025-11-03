@@ -5,7 +5,7 @@ model:
   _target_: models.cnn_lstm.CNNLSTM
   _partial_: true
   hidden_size: 64
-  num_layers: 2
+  num_layers: 4
   dropout: 0.1
   # CNN backbone parameters
   cnn_n_blocks: [1, 1]

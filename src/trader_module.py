@@ -1,4 +1,4 @@
-from typing import Any, Dict, Tuple, Type, Callable
+from typing import Any, Dict, Tuple, Type, Callable, List
 
 import torch
 import torch.nn as nn
@@ -62,8 +62,7 @@ class TraderLitModule(LightningModule):
         self.val_trade_ap = BinaryAveragePrecision()
         self.val_pr_curve = PrecisionRecallCurve(task="binary")
 
-        # Store probs for histogram logging
-        self.val_step_outputs = []
+        self.val_epoch_outputs: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -73,7 +72,7 @@ class TraderLitModule(LightningModule):
         self.val_trade_acc.reset()
         self.val_trade_ap.reset()
         self.val_pr_curve.reset()
-        self.val_step_outputs.clear()
+        self.val_epoch_outputs.clear()
 
         # Initialize loss function based on use_focal_loss flag
         if self.trainer is not None:
@@ -211,7 +210,7 @@ class TraderLitModule(LightningModule):
         self.val_pr_curve.update(probs, targets)
 
         # Store probs for histogram logging
-        self.val_step_outputs.append(probs.detach())
+        self.val_epoch_outputs.append((probs.detach(), targets.detach()))
 
         self.log(
             "val/trade_loss",
@@ -236,8 +235,10 @@ class TraderLitModule(LightningModule):
         )
 
     def on_validation_epoch_end(self) -> None:
+        # 1. Tính toán PR curve tổng hợp (metric cũ)
         precisions, recalls, thresholds = self.val_pr_curve.compute()
 
+        # 2. Kiểm tra nếu không phải sanity check và có logger
         if not self.trainer.sanity_checking and self.logger is not None:
             loggers = self.logger if isinstance(self.logger, list) else [self.logger]
             wandb_logger = None
@@ -250,34 +251,98 @@ class TraderLitModule(LightningModule):
                     break
 
             if wandb_logger is not None and hasattr(wandb_logger, "experiment"):
-                precisions = precisions.cpu().numpy()
-                recalls = recalls.cpu().numpy()
 
-                # Create data table for wandb
-                table = wandb.Table(
-                    data=[[float(r), float(p)] for r, p in zip(recalls, precisions)],
+                # --- A. Xử lý PR Curve (Logic cũ) ---
+                log_payload = {}
+                precisions_np = precisions.cpu().numpy()
+                recalls_np = recalls.cpu().numpy()
+
+                pr_table = wandb.Table(
+                    data=[
+                        [float(r), float(p)] for r, p in zip(recalls_np, precisions_np)
+                    ],
                     columns=["Recall", "Precision"],
                 )
-
-                # Log probability distribution histogram
-                all_probs = torch.cat(self.val_step_outputs).cpu()
-
-                wandb_logger.experiment.log(
-                    {
-                        "val/pr_curve": wandb.plot.line(
-                            table,
-                            "Recall",
-                            "Precision",
-                            title="PR Curve",
-                        ),
-                        "val/prob_distribution": wandb.Histogram(all_probs.numpy()),
-                    },
+                log_payload["val/pr_curve"] = wandb.plot.line(
+                    pr_table, "Recall", "Precision", title="PR Curve"
                 )
 
-                # Clear the list for next epoch
-                self.val_step_outputs.clear()
+                # --- B. Xử lý Histogram & Bảng AP ---
+                if not self.val_epoch_outputs:
+                    # Nếu không có output, chỉ log PR curve
+                    wandb_logger.experiment.log(log_payload)
+                    self.val_pr_curve.reset()
+                    return
 
-        # Reset metric for next epoch
+                # Tổng hợp tất cả outputs từ các validation step
+                all_probs = torch.cat(
+                    [item[0] for item in self.val_epoch_outputs], dim=0
+                )  # (N_samples, P_coins)
+                all_targets = torch.cat(
+                    [item[1] for item in self.val_epoch_outputs], dim=0
+                )  # (N_samples, P_coins)
+
+                # Xóa danh sách cho epoch tiếp theo
+                self.val_epoch_outputs.clear()
+
+                # Log histogram
+                all_probs_flat = all_probs.cpu().numpy().flatten()
+                log_payload["val/prob_distribution"] = wandb.Histogram(all_probs_flat)
+
+                # --- LOGIC MỚI: TẠO BẢNG AP (MODEL vs BASELINE) ---
+                datamodule = self.trainer.datamodule
+
+                # Lấy dictionary baseline từ datamodule
+                coin_baselines = getattr(datamodule, "coin_baselines", {})
+
+                num_coins = all_probs.shape[1]
+                val_coin_names = []
+
+                if (
+                    isinstance(datamodule, CryptoDataModule)
+                    and datamodule.val_coin_names is not None
+                    and len(datamodule.val_coin_names) == num_coins
+                ):
+                    val_coin_names = datamodule.val_coin_names
+                else:
+                    val_coin_names = [f"coin_{i}" for i in range(num_coins)]
+
+                per_coin_ap_metric = BinaryAveragePrecision().to(self.device)
+                ap_table_data = []
+
+                for i in range(num_coins):
+                    coin_name = val_coin_names[i]
+                    coin_probs = all_probs[:, i]
+                    coin_targets = all_targets[:, i]
+
+                    # 1. Tính Model AP
+                    model_ap = per_coin_ap_metric(coin_probs, coin_targets.int()).item()
+                    per_coin_ap_metric.reset()
+
+                    # 2. Lấy Baseline AP (từ datamodule)
+                    baseline_ap = coin_baselines.get(coin_name, 0.0)
+
+                    # 3. Tính Lift
+                    lift = model_ap / baseline_ap if baseline_ap > 0 else 0.0
+                    lift_str = f"{lift:.2f}x"
+
+                    ap_table_data.append([coin_name, model_ap, baseline_ap, lift_str])
+
+                # Sắp xếp bảng theo Model AP giảm dần
+                ap_table_data.sort(key=lambda x: x[1], reverse=True)
+
+                # Tạo bảng wandb với các cột mới
+                ap_table = wandb.Table(
+                    data=ap_table_data,
+                    columns=["Coin", "AP", "Baseline AP", "Lift"],
+                )
+                log_payload["val/trade_ap_table"] = ap_table
+                # --- KẾT THÚC LOGIC MỚI ---
+
+                # Log tất cả lên wandb
+                wandb_logger.experiment.log(log_payload)
+
+        # Reset metric tổng hợp cho epoch tiếp theo
         self.val_pr_curve.reset()
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
