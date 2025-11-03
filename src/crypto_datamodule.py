@@ -194,6 +194,9 @@ class CryptoDataModule(LightningDataModule):
 
         self.coin_baselines = {}
 
+        # --- Per-Coin BCE Weights ---
+        self.coin_pos_weights_tensor = None
+
     def _setup_feature_config(self):
         """
         Defines the feature configuration and creates all necessary
@@ -341,6 +344,9 @@ class CryptoDataModule(LightningDataModule):
 
         # --- 8. Calculate coin baselines ---
         self._calculate_coin_baselines()
+
+        # --- 9. Calculate per-coin BCE pos_weights ---
+        self._calculate_coin_pos_weights()
 
         print(f"--- Setup complete ---")
         print(f"  Total valid train samples: {len(self.train_indices):,}")
@@ -617,6 +623,60 @@ class CryptoDataModule(LightningDataModule):
                 print(f"  {coin}: {self.coin_baselines.get(coin, 0.0):.4f}")
         else:
             print(" (No val_coin_names to display sample)")
+
+    def _calculate_coin_pos_weights(self):
+        """
+        Calculates the BCE 'pos_weight' (n_neg / n_pos) for each coin
+        using only valid training samples.
+        """
+        print("Calculating per-coin BCE pos_weights from training data...")
+        if self.train_indices is None or len(self.train_indices) == 0:
+            print("No training indices found. Using default pos_weight=1.0")
+            self.coin_pos_weights_tensor = torch.ones(
+                len(self.coins), dtype=torch.float32
+            )
+            return
+
+        n_coins = len(self.coins)
+        n_timestamps = len(self.master_timestamps)
+
+        unique_train_indices = np.unique(self.train_indices)
+        train_mask_full = np.zeros(n_timestamps, dtype=bool)
+        train_mask_full[unique_train_indices] = True
+
+        valid_train_mask = self.mask_aligned & train_mask_full[None, :]
+
+        # 1. Tính số sample positive (nhãn 1)
+        n_positive = np.sum(
+            self.all_labels_trade_aligned & valid_train_mask, axis=1
+        ).astype(np.float32)
+
+        # 2. Tính tổng số sample
+        n_total_valid = np.sum(valid_train_mask, axis=1).astype(np.float32)
+
+        # 3. Tính số sample negative (nhãn 0)
+        n_negative = n_total_valid - n_positive
+
+        # 4. Tính pos_weight = n_negative / n_positive
+        # Đặt weight = 1.0 nếu n_positive = 0 (để tránh chia cho 0)
+        pos_weights = np.divide(
+            n_negative,
+            n_positive,
+            out=np.ones(n_coins, dtype=np.float32),
+            where=n_positive > 0,
+        )
+
+        # 5. Lưu trữ dưới dạng tensor
+        self.coin_pos_weights_tensor = torch.from_numpy(pos_weights.astype(np.float32))
+
+        print("Per-coin BCE pos_weights calculated (sample):")
+        if getattr(self, "val_coin_names", None):
+            val_indices_map = {name: i for i, name in enumerate(self.coins)}
+            for coin_name in self.val_coin_names[:5]:
+                coin_idx = val_indices_map.get(coin_name)
+                if coin_idx is not None:
+                    weight = self.coin_pos_weights_tensor[coin_idx].item()
+                    print(f"  {coin_name}: {weight:.4f}")
 
     def _find_samples_and_split(self):
         """
@@ -919,6 +979,7 @@ class CryptoDataModule(LightningDataModule):
             list_stats = []
             list_labels_trade = []
             list_labels_dir = []
+            list_pos_weights = []
 
             for i, ts_idx in enumerate(batch_timestamp_indices):
                 if is_train:
@@ -939,6 +1000,11 @@ class CryptoDataModule(LightningDataModule):
                             f"No valid coins at time {ts_idx} for validation"
                         )
 
+                # pos_weight slice for selected coins (P,)
+                pos_weights_slice = self.coin_pos_weights_tensor[
+                    torch.from_numpy(coin_indices)
+                ]
+
                 features_slice = self.all_features_aligned[
                     coin_indices, (ts_idx - T + 1) : (ts_idx + 1), :
                 ]
@@ -950,11 +1016,15 @@ class CryptoDataModule(LightningDataModule):
                 list_stats.append(stats_slice)
                 list_labels_trade.append(labels_trade_slice)
                 list_labels_dir.append(labels_dir_slice)
+                list_pos_weights.append(pos_weights_slice)
 
             batch_features = np.stack(list_features)
             batch_stats = np.stack(list_stats)
             batch_labels_trade = np.stack(list_labels_trade)
             batch_labels_dir = np.stack(list_labels_dir)
+
+            # (B, P)
+            batch_pos_weights = torch.stack(list_pos_weights)
 
             self._normalize_batch(batch_features, batch_stats)
 
@@ -962,6 +1032,7 @@ class CryptoDataModule(LightningDataModule):
                 "features": torch.from_numpy(batch_features),
                 "labels_trade": torch.from_numpy(batch_labels_trade),
                 "labels_dir": torch.from_numpy(batch_labels_dir),
+                "pos_weights": batch_pos_weights,
             }
 
         return collate_fn

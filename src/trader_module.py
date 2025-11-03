@@ -74,66 +74,32 @@ class TraderLitModule(LightningModule):
         self.val_pr_curve.reset()
         self.val_epoch_outputs.clear()
 
-        # Initialize loss function based on use_focal_loss flag
-        if self.trainer is not None:
-            datamodule = self.trainer.datamodule
-            if (
-                isinstance(datamodule, CryptoDataModule)
-                and datamodule.class_weights is not None
-            ):
-                class_weights = datamodule.class_weights.to(self.device)
-
-                if self.use_focal_loss:
-                    # Calculate alpha for focal loss from class weights
-                    # alpha = weight_class_1 / (weight_class_0 + weight_class_1)
+        # Logic loss sẽ được xử lý trong model_step sử dụng per-coin weights
+        # Chỉ khởi tạo loss_fn nếu dùng Focal Loss
+        if self.use_focal_loss:
+            # Focal loss với alpha toàn cục (rút từ class_weights nếu có)
+            global_alpha = 0.5
+            if self.trainer is not None:
+                datamodule = self.trainer.datamodule
+                if (
+                    isinstance(datamodule, CryptoDataModule)
+                    and getattr(datamodule, "class_weights", None) is not None
+                ):
+                    class_weights = datamodule.class_weights.to(self.device)
                     total_weight = class_weights[0] + class_weights[1]
-                    focal_alpha = (class_weights[1] / total_weight).item()
+                    global_alpha = (class_weights[1] / total_weight).item()
 
-                    focal_loss = BinaryFocalLoss(
-                        alpha=focal_alpha, gamma=self.gamma, reduction="mean"
-                    )
-                    self.loss_fn = focal_loss
-
-                    print(
-                        f"Using Focal Loss: alpha={focal_alpha:.4f}, gamma={self.gamma:.4f}"
-                    )
-                    print(f"Class weights: {class_weights}")
-                else:
-                    # Use BCE with class weights
-                    # pos_weight = weight_class_1 / weight_class_0
-                    pos_weight = (class_weights[1] / class_weights[0]).to(self.device)
-
-                    # Create closure with pos_weight captured
-                    def make_bce_loss_fn(pos_w: torch.Tensor):
-                        def bce_loss_fn(
-                            logits: torch.Tensor, targets: torch.Tensor
-                        ) -> torch.Tensor:
-                            return nn.functional.binary_cross_entropy_with_logits(
-                                logits, targets.float(), pos_weight=pos_w
-                            )
-
-                        return bce_loss_fn
-
-                    self.loss_fn = make_bce_loss_fn(pos_weight)
-
-                    print(f"Using BCE with pos_weight={pos_weight.item():.4f}")
-                    print(f"Class weights: {class_weights}")
-            else:
-                # Fallback: standard loss without weights
-                if self.use_focal_loss:
-                    focal_loss = BinaryFocalLoss(
-                        alpha=0.5, gamma=self.gamma, reduction="mean"
-                    )
-                    self.loss_fn = focal_loss
-                    print(
-                        f"Using Focal Loss (no class weights): alpha=0.5, gamma={self.gamma:.4f}"
-                    )
-                else:
-                    # Standard BCE without weights
-                    self.loss_fn = lambda logits, targets: nn.functional.binary_cross_entropy_with_logits(
-                        logits, targets.float()
-                    )
-                    print("Using standard BCE (no class weights available)")
+            focal_loss = BinaryFocalLoss(
+                alpha=global_alpha, gamma=self.gamma, reduction="mean"
+            )
+            self.loss_fn = focal_loss
+            print(
+                f"Using Focal Loss (Global Alpha): alpha={global_alpha:.4f}, gamma={self.gamma:.4f}"
+            )
+        else:
+            # Sẽ sử dụng per-coin weight BCE trong model_step
+            self.loss_fn = None
+            print("Using Per-Coin Weighted BCE (weights from batch)")
 
     def model_step(
         self, batch: Dict[str, torch.Tensor]
@@ -141,17 +107,29 @@ class TraderLitModule(LightningModule):
         features = batch["features"]  # (B, P, T, D)
         targets = batch["labels_trade"]  # (B, P), bool type
 
+        # Lấy pos_weights từ batch
+        pos_weights = batch.get("pos_weights", None)  # (B, P)
+
         logits = self.forward(features)  # (B, P, 1)
         logits = logits.squeeze(-1)  # (B, P)
 
-        # Calculate loss using initialized loss function
-        if self.loss_fn is None:
-            # Fallback if loss_fn not initialized
-            loss = nn.functional.binary_cross_entropy_with_logits(
-                logits, targets.float()
-            )
+        targets_float = targets.float()
+
+        # Tính toán loss
+        if self.use_focal_loss and self.loss_fn is not None:
+            # Focal Loss (alpha toàn cục)
+            loss = self.loss_fn(logits, targets_float)
         else:
-            loss = self.loss_fn(logits, targets.float())
+            # Per-coin weighted BCE
+            if pos_weights is None:
+                loss = nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets_float
+                )
+            else:
+                pos_weights_device = pos_weights.to(logits.device)
+                loss = nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets_float, pos_weight=pos_weights_device
+                )
 
         # Get probabilities and binary predictions for metrics
         probs = torch.sigmoid(logits)  # (B, P)
