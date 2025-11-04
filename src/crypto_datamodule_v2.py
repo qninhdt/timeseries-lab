@@ -13,16 +13,24 @@ from numba import jit
 from torch.utils.data import Dataset, DataLoader
 from lightning import LightningDataModule
 from typing import Optional, Dict, Any, List, Tuple
-from joblib import Parallel, delayed
-from tqdm import tqdm
+
+# (Đã xóa joblib)
+# Thêm lại rich.progress
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 # --- Constants ---
 warnings.simplefilter("ignore", category=RuntimeWarning)
 pd.options.mode.chained_assignment = None
 
 # ========================================================================
-# 1. STANDALONE DATA PROCESSING PIPELINE
-# (Các hàm này không thay đổi - chúng đã đúng)
+# 1. STANDALONE HELPER FUNCTIONS (Numba, Config)
 # ========================================================================
 
 
@@ -33,18 +41,24 @@ def _calculate_labels_numba(
     barrier_atr_multiplier: float,
     horizon: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Numba-accelerated triple-barrier labeling.
+    """
     n = len(close_prices)
     labels_trade = np.zeros(n, dtype=np.bool_)
     labels_dir = np.zeros(n, dtype=np.bool_)
+
     for i in range(n - 1):
         entry_price = close_prices[i]
         atr = atr_values[i]
         if np.isnan(atr) or atr <= 0:
             continue
+
         barrier_distance = atr * barrier_atr_multiplier
         upper_barrier = entry_price + barrier_distance
         lower_barrier = entry_price - barrier_distance
         end_idx = min(i + 1 + horizon, n)
+
         for j in range(i + 1, end_idx):
             if close_prices[j] >= upper_barrier:
                 labels_trade[i] = True
@@ -56,156 +70,6 @@ def _calculate_labels_numba(
                 break
     return labels_trade, labels_dir
 
-
-def load_single_coin_data(
-    data_dir: Path, coin: str, end_date: pd.Timestamp
-) -> Optional[pd.DataFrame]:
-    filename = f"{coin.lower()}.parquet"
-    filepath = data_dir / "data" / filename
-    if not filepath.exists():
-        return None
-    df = pd.read_parquet(filepath)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df[df["date"] <= end_date]
-    if df.empty:
-        return None
-    return df[["date", "open", "high", "low", "close", "volume"]].copy()
-
-
-def process_coin_numpy_optimized(
-    df_raw: pd.DataFrame,
-    feature_names: List[str],
-    barrier_atr_multiplier: float,
-    barrier_horizon: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    open_p = df_raw["open"].values
-    high_p = df_raw["high"].values
-    low_p = df_raw["low"].values
-    close_p = df_raw["close"].values
-    volume = df_raw["volume"].values
-    dates = df_raw["date"].values
-    cols = {
-        "open": open_p,
-        "high": high_p,
-        "low": low_p,
-        "close": close_p,
-        "volume": volume,
-    }
-    cols["log_return"] = np.log(close_p / (np.roll(close_p, 1) + 1e-8)).astype(
-        np.float32
-    )
-    cols["sar"] = talib.SAR(high_p, low_p).astype(np.float32)
-    bb_upper, _, bb_lower = talib.BBANDS(close_p, timeperiod=20)
-    cols["bb_upper"] = bb_upper.astype(np.float32)
-    cols["bb_lower"] = bb_lower.astype(np.float32)
-    cols["adx"] = (talib.ADX(high_p, low_p, close_p, timeperiod=14) / 50.0).astype(
-        np.float32
-    ) - 1.0
-    cols["rsi"] = (talib.RSI(close_p, timeperiod=14) / 50.0).astype(np.float32) - 1.0
-    stoch_k, stoch_d = talib.STOCH(high_p, low_p, close_p)
-    cols["stoch_k"] = (stoch_k / 50.0).astype(np.float32) - 1.0
-    cols["stoch_d"] = (stoch_d / 50.0).astype(np.float32) - 1.0
-    cci_raw = talib.CCI(high_p, low_p, close_p, timeperiod=14)
-    cols["cci"] = (np.clip(cci_raw, -200, 200) / 200.0).astype(np.float32)
-    cols["mfi"] = (
-        talib.MFI(high_p, low_p, close_p, volume, timeperiod=14) / 50.0
-    ).astype(np.float32) - 1.0
-    roc_raw = talib.ROC(close_p, timeperiod=10)
-    cols["roc"] = (np.clip(roc_raw, -20, 20) / 20.0).astype(np.float32)
-    cols["cmf"] = pta.cmf(
-        df_raw["high"], df_raw["low"], df_raw["close"], df_raw["volume"], length=20
-    ).values.astype(np.float32)
-    macd, macd_signal, _ = talib.MACD(close_p)
-    cols["macd"] = macd.astype(np.float32)
-    cols["macd_signal"] = macd_signal.astype(np.float32)
-    cols["ema_20"] = talib.EMA(close_p, timeperiod=20).astype(np.float32)
-    cols["ema_50"] = talib.EMA(close_p, timeperiod=50).astype(np.float32)
-    cols["sma_20"] = talib.SMA(close_p, timeperiod=20).astype(np.float32)
-    cols["sma_50"] = talib.SMA(close_p, timeperiod=50).astype(np.float32)
-    cols["obv"] = talib.OBV(close_p, volume).astype(np.float32)
-    cols["atr"] = talib.ATR(high_p, low_p, close_p, timeperiod=14).astype(np.float32)
-    cols["candle_range"] = ((high_p - low_p) / (open_p + 1e-8)).astype(np.float32)
-    cols["candle_body_pct"] = (
-        np.abs(close_p - open_p) / (high_p - low_p + 1e-8)
-    ).astype(np.float32)
-    cols["candle_wick_pct"] = (
-        (high_p - np.maximum(open_p, close_p)) / (high_p - low_p + 1e-8)
-    ).astype(np.float32)
-    cols["temporal_sin"] = np.sin(
-        2 * np.pi * df_raw["date"].dt.hour / 24.0
-    ).values.astype(np.float32)
-    cols["temporal_cos"] = np.cos(
-        2 * np.pi * df_raw["date"].dt.hour / 24.0
-    ).values.astype(np.float32)
-    labels_trade, labels_dir = _calculate_labels_numba(
-        close_p, cols["atr"], barrier_atr_multiplier, barrier_horizon
-    )
-    cols["label_trade"] = labels_trade
-    cols["label_dir"] = labels_dir
-
-    # convert open, high, low, close, volume to float32
-    cols["open"] = cols["open"].astype(np.float32)
-    cols["high"] = cols["high"].astype(np.float32)
-    cols["low"] = cols["low"].astype(np.float32)
-    cols["close"] = cols["close"].astype(np.float32)
-    cols["volume"] = cols["volume"].astype(np.float32)
-
-    df = pd.DataFrame(cols, index=dates)
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    feature_df = df[feature_names]
-    feature_df = feature_df.ffill().bfill().fillna(0)
-    features_array = feature_df.values.astype(np.float32)
-    labels_trade_array = df["label_trade"].values.astype(np.bool_)
-    labels_dir_array = df["label_dir"].values.astype(np.bool_)
-    return (dates, features_array, labels_trade_array, labels_dir_array)
-
-
-def process_coin_job(
-    coin_info: Tuple[int, str],
-    data_dir: Path,
-    end_date: pd.Timestamp,
-    date_to_idx_map: Dict[pd.Timestamp, int],
-    feature_names: List[str],
-    barrier_atr_multiplier: float,
-    barrier_horizon: int,
-) -> Optional[Tuple]:
-    coin_idx, coin = coin_info
-    try:
-        df_raw = load_single_coin_data(data_dir, coin, end_date)
-        if df_raw is None:
-            return None
-        (dates, features_array, labels_trade_array, labels_dir_array) = (
-            process_coin_numpy_optimized(
-                df_raw, feature_names, barrier_atr_multiplier, barrier_horizon
-            )
-        )
-        master_indices, df_indices = [], []
-        for i, date in enumerate(dates):
-            if date in date_to_idx_map:
-                master_indices.append(date_to_idx_map[date])
-                df_indices.append(i)
-        if not master_indices:
-            return None
-        valid_features = features_array[df_indices].astype(np.float32)
-        labels_trade = labels_trade_array[df_indices]
-        labels_dir = labels_dir_array[df_indices]
-        local_indices_for_map = np.arange(len(df_indices), dtype=np.int32)
-        return (
-            coin_idx,
-            valid_features,
-            master_indices,
-            local_indices_for_map,
-            labels_trade,
-            labels_dir,
-        )
-    except Exception as e:
-        print(f"[Warning] Error processing {coin} (idx {coin_idx}): {e}")
-        return None
-
-
-# ========================================================================
-# 2. DATA STRUCTURES (Config & Dataset)
-# ========================================================================
 
 FEATURE_CONFIG = {
     "open": {"norm_type": 2},
@@ -241,7 +105,18 @@ FEATURE_CONFIG = {
 }
 
 
+# ========================================================================
+# 2. DATASET (Minimalist)
+# ========================================================================
+
+
 class CryptoPortfolioDataset(Dataset):
+    """
+    Minimalist Dataset.
+    Returns a single integer (timestamp index).
+    The collate_fn handles all batch assembly logic.
+    """
+
     def __init__(self, sample_indices: np.ndarray):
         self.sample_indices = sample_indices
 
@@ -253,11 +128,16 @@ class CryptoPortfolioDataset(Dataset):
 
 
 # ========================================================================
-# 3. DATAMODULE ORCHESTRATOR
+# 3. DATAMODULE (Orchestrator & Data Holder)
 # ========================================================================
 
 
 class CryptoDataModuleV2(LightningDataModule):
+    """
+    Refactored DataModule using a sequential (single-thread) setup loop.
+    This is the most memory-stable option, albeit the slowest to setup.
+    """
+
     def __init__(
         self,
         data_dir: str = "./data/crypto-1200",
@@ -275,12 +155,18 @@ class CryptoDataModuleV2(LightningDataModule):
     ):
         super().__init__()
         self.save_hyperparameters()
+
+        # --- Paths and Dates ---
         self.data_dir = Path(self.hparams.data_dir)
         self.end_date = pd.to_datetime(self.hparams.end_date, utc=True)
         self.validation_start_date = pd.to_datetime(
             self.hparams.validation_start_date, utc=True
         )
+
+        # --- Feature Config ---
         self.feature_names = list(FEATURE_CONFIG.keys())
+
+        # --- Internal State ---
         self.coins: List[str] = []
         self.master_timestamps: np.ndarray = None
         self.date_to_idx_map: Dict[pd.Timestamp, int] = {}
@@ -288,6 +174,8 @@ class CryptoDataModuleV2(LightningDataModule):
         self.val_indices: np.ndarray = None
         self.val_coin_indices: np.ndarray = None
         self.coin_baselines: Dict[str, float] = {}
+
+        # --- Optimized Data Storage ---
         self.all_labels_trade_aligned: np.ndarray = None
         self.all_labels_dir_aligned: np.ndarray = None
         self.mask_aligned: np.ndarray = None
@@ -299,8 +187,8 @@ class CryptoDataModuleV2(LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         """
-        Main setup: Runs parallel processing *before* allocating large arrays
-        to keep worker process memory small.
+        Main setup method.
+        Runs a sequential loop to process coins one-by-one.
         """
         if self.master_to_local_map_aligned is not None:
             print("Data already set up.")
@@ -314,6 +202,7 @@ class CryptoDataModuleV2(LightningDataModule):
             raise FileNotFoundError(f"metadata.json not found in {self.data_dir}")
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
+
         self.coins = sorted(
             metadata["coins"].keys(),
             key=lambda x: metadata["coins"][x]["duration_days"],
@@ -336,31 +225,7 @@ class CryptoDataModuleV2(LightningDataModule):
         }
         n_timestamps = len(self.master_timestamps)
 
-        # --- 2. "Map" Step: Run parallel jobs ---
-        # We run this *before* creating large arrays.
-        # The main process memory is small, so worker
-        # processes will also be small.
-        jobs = list(enumerate(self.coins))
-        print(f"Starting parallel processing for {n_coins} coins...")
-
-        results = Parallel(n_jobs=-1, backend="multiprocessing")(
-            delayed(process_coin_job)(
-                coin_info,
-                self.data_dir,
-                self.end_date,
-                self.date_to_idx_map,
-                self.feature_names,
-                self.hparams.barrier_atr_multiplier,
-                self.hparams.barrier_horizon,
-            )
-            for coin_info in tqdm(jobs, desc="Processing coins")
-        )
-
-        print("Parallel processing complete. Initializing arrays...")
-
-        # --- 3. Initialize Data Holders ---
-        # Now that parallel step is done, we allocate memory
-        # in the main process.
+        # --- 2. Initialize Empty Data Holders ---
         self.all_labels_trade_aligned = np.full(
             (n_coins, n_timestamps), False, dtype=np.bool_
         )
@@ -372,36 +237,32 @@ class CryptoDataModuleV2(LightningDataModule):
             (n_coins, n_timestamps), -1, dtype=np.int32
         )
         self.features_per_coin = [None] * n_coins
+        print("Initialized empty data arrays.")
 
-        # --- 4. "Reduce" Step: Fill arrays from job results ---
-        # This will temporarily double memory, but only in the main process.
-        print("Filling arrays (Reduce step)...")
-        for result in results:
-            if result is None:
-                continue
+        # --- 3. Run sequential processing ---
+        print(f"Starting sequential processing for {n_coins} coins...")
 
-            (
-                coin_idx,
-                valid_features,
-                master_indices,
-                local_indices_map,
-                labels_trade,
-                labels_dir,
-            ) = result
+        jobs = list(enumerate(self.coins))
 
-            self.all_labels_trade_aligned[coin_idx, master_indices] = labels_trade
-            self.all_labels_dir_aligned[coin_idx, master_indices] = labels_dir
-            self.mask_aligned[coin_idx, master_indices] = True
-            self.features_per_coin[coin_idx] = valid_features
-            self.master_to_local_map_aligned[coin_idx, master_indices] = (
-                local_indices_map
-            )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            TimeElapsedColumn(),
+        ) as progress:
+            task = progress.add_task(f"Processing {n_coins} coins", total=n_coins)
 
-        print("Data filling complete.")
-        del results  # Free the large intermediate list
+            for coin_info in jobs:
+                # Call the processing function directly
+                self._process_and_fill_coin(coin_info)
+                progress.update(task, advance=1)
+
+        print("Sequential processing complete.")
         gc.collect()
 
-        # --- 5. Post-processing ---
+        # --- 4. Post-processing (Splitting, Masking) ---
         self._calculate_validity_mask()
         self._find_samples_and_split()
         self._find_validation_coins()
@@ -410,6 +271,174 @@ class CryptoDataModuleV2(LightningDataModule):
         print(f"--- Setup complete ---")
         print(f"  Total valid train samples: {len(self.train_indices):,}")
         print(f"  Total valid val samples: {len(self.val_indices):,}")
+
+    # --- Processing Functions (Called Sequentially) ---
+
+    def _load_single_coin_data(self, coin: str) -> Optional[pd.DataFrame]:
+        """
+        Loads and filters Parquet data for a single coin.
+        """
+        filename = f"{coin.lower()}.parquet"
+        filepath = self.data_dir / "data" / filename
+        if not filepath.exists():
+            return None
+
+        df = pd.read_parquet(filepath)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df[df["date"] <= self.end_date]
+
+        if df.empty:
+            return None
+
+        return df[["date", "open", "high", "low", "close", "volume"]].copy()
+
+    def _process_coin_numpy_optimized(
+        self, df_raw: pd.DataFrame
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Calculates all features (TA-lib) and labels (Numba) for a single coin's DataFrame.
+        """
+        open_p = df_raw["open"].values
+        high_p = df_raw["high"].values
+        low_p = df_raw["low"].values
+        close_p = df_raw["close"].values
+        volume = df_raw["volume"].values
+        dates = df_raw["date"].values
+
+        cols = {
+            "open": open_p,
+            "high": high_p,
+            "low": low_p,
+            "close": close_p,
+            "volume": volume,
+        }
+
+        cols["log_return"] = np.log(close_p / (np.roll(close_p, 1) + 1e-8)).astype(
+            np.float32
+        )
+        cols["sar"] = talib.SAR(high_p, low_p).astype(np.float32)
+        bb_upper, _, bb_lower = talib.BBANDS(close_p, timeperiod=20)
+        cols["bb_upper"] = bb_upper.astype(np.float32)
+        cols["bb_lower"] = bb_lower.astype(np.float32)
+
+        cols["adx"] = (talib.ADX(high_p, low_p, close_p, timeperiod=14) / 50.0).astype(
+            np.float32
+        ) - 1.0
+        cols["rsi"] = (talib.RSI(close_p, timeperiod=14) / 50.0).astype(
+            np.float32
+        ) - 1.0
+        stoch_k, stoch_d = talib.STOCH(high_p, low_p, close_p)
+        cols["stoch_k"] = (stoch_k / 50.0).astype(np.float32) - 1.0
+        cols["stoch_d"] = (stoch_d / 50.0).astype(np.float32) - 1.0
+        cci_raw = talib.CCI(high_p, low_p, close_p, timeperiod=14)
+        cols["cci"] = (np.clip(cci_raw, -200, 200) / 200.0).astype(np.float32)
+        cols["mfi"] = (
+            talib.MFI(high_p, low_p, close_p, volume, timeperiod=14) / 50.0
+        ).astype(np.float32) - 1.0
+        roc_raw = talib.ROC(close_p, timeperiod=10)
+        cols["roc"] = (np.clip(roc_raw, -20, 20) / 20.0).astype(np.float32)
+
+        cols["cmf"] = pta.cmf(
+            df_raw["high"], df_raw["low"], df_raw["close"], df_raw["volume"], length=20
+        ).values.astype(np.float32)
+
+        macd, macd_signal, _ = talib.MACD(close_p)
+        cols["macd"] = macd.astype(np.float32)
+        cols["macd_signal"] = macd_signal.astype(np.float32)
+
+        cols["ema_20"] = talib.EMA(close_p, timeperiod=20).astype(np.float32)
+        cols["ema_50"] = talib.EMA(close_p, timeperiod=50).astype(np.float32)
+        cols["sma_20"] = talib.SMA(close_p, timeperiod=20).astype(np.float32)
+        cols["sma_50"] = talib.SMA(close_p, timeperiod=50).astype(np.float32)
+        cols["obv"] = talib.OBV(close_p, volume).astype(np.float32)
+        cols["atr"] = talib.ATR(high_p, low_p, close_p, timeperiod=14).astype(
+            np.float32
+        )
+
+        cols["candle_range"] = ((high_p - low_p) / (open_p + 1e-8)).astype(np.float32)
+        cols["candle_body_pct"] = (
+            np.abs(close_p - open_p) / (high_p - low_p + 1e-8)
+        ).astype(np.float32)
+        cols["candle_wick_pct"] = (
+            (high_p - np.maximum(open_p, close_p)) / (high_p - low_p + 1e-8)
+        ).astype(np.float32)
+
+        cols["temporal_sin"] = np.sin(
+            2 * np.pi * df_raw["date"].dt.hour / 24.0
+        ).values.astype(np.float32)
+        cols["temporal_cos"] = np.cos(
+            2 * np.pi * df_raw["date"].dt.hour / 24.0
+        ).values.astype(np.float32)
+
+        labels_trade, labels_dir = _calculate_labels_numba(
+            close_p,
+            cols["atr"],
+            self.hparams.barrier_atr_multiplier,
+            self.hparams.barrier_horizon,
+        )
+        cols["label_trade"] = labels_trade
+        cols["label_dir"] = labels_dir
+
+        df = pd.DataFrame(cols, index=dates)
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        feature_df = df[self.feature_names]
+        feature_df = feature_df.ffill().bfill().fillna(0)
+
+        features_array = feature_df.values.astype(np.float32)
+        labels_trade_array = df["label_trade"].values.astype(np.bool_)
+        labels_dir_array = df["label_dir"].values.astype(np.bool_)
+
+        return (dates, features_array, labels_trade_array, labels_dir_array)
+
+    def _process_and_fill_coin(self, coin_info: Tuple[int, str]):
+        """
+        The main sequential "pipeline" function for a single coin.
+        It loads, processes, and writes results directly to class arrays.
+        """
+        coin_idx, coin = coin_info
+
+        try:
+            df_raw = self._load_single_coin_data(coin)
+            if df_raw is None:
+                return
+
+            (
+                dates,
+                features_array,
+                labels_trade_array,
+                labels_dir_array,
+            ) = self._process_coin_numpy_optimized(df_raw)
+
+            master_indices = []
+            df_indices = []
+            for i, date in enumerate(dates):
+                if date in self.date_to_idx_map:
+                    master_indices.append(self.date_to_idx_map[date])
+                    df_indices.append(i)
+            if not master_indices:
+                return
+
+            valid_features = features_array[df_indices].astype(np.float32)
+            local_indices_for_map = np.arange(len(df_indices), dtype=np.int32)
+
+            # Direct write
+            self.all_labels_trade_aligned[coin_idx, master_indices] = (
+                labels_trade_array[df_indices]
+            )
+            self.all_labels_dir_aligned[coin_idx, master_indices] = labels_dir_array[
+                df_indices
+            ]
+            self.mask_aligned[coin_idx, master_indices] = True
+            self.features_per_coin[coin_idx] = valid_features
+            self.master_to_local_map_aligned[coin_idx, master_indices] = (
+                local_indices_for_map
+            )
+
+        except Exception as e:
+            print(f"[Warning] Error processing {coin} (idx {coin_idx}): {e}")
+
+    # --- Post-Processing Functions ---
 
     def _calculate_validity_mask(self):
         """
@@ -424,6 +453,7 @@ class CryptoDataModuleV2(LightningDataModule):
             min_count=self.hparams.lookback_window,
         )
         valid_lookback = history_counts == self.hparams.lookback_window
+
         self.mask_aligned = history_mask & valid_lookback
 
     def _calculate_coin_baselines(self):
@@ -432,22 +462,28 @@ class CryptoDataModuleV2(LightningDataModule):
         if self.train_indices is None or len(self.train_indices) == 0:
             self.coin_baselines = {coin: 0.0 for coin in self.coins}
             return
+
         n_coins = len(self.coins)
         n_timestamps = len(self.master_timestamps)
+
         unique_train_indices = np.unique(self.train_indices)
         train_mask_full = np.zeros(n_timestamps, dtype=bool)
         train_mask_full[unique_train_indices] = True
+
         valid_train_mask = self.mask_aligned & train_mask_full[None, :]
+
         n_positive_trades = np.sum(
             self.all_labels_trade_aligned & valid_train_mask, axis=1
         )
         n_total_valid_samples = np.sum(valid_train_mask, axis=1)
+
         baselines = np.divide(
             n_positive_trades,
             n_total_valid_samples,
             out=np.full(n_coins, np.nan),
             where=n_total_valid_samples > 0,
         )
+
         self.coin_baselines = {
             self.coins[i]: (baselines[i] if not np.isnan(baselines[i]) else 0.0)
             for i in range(n_coins)
@@ -461,6 +497,7 @@ class CryptoDataModuleV2(LightningDataModule):
         valid_coins_per_timestamp = np.sum(self.mask_aligned, axis=0)
         valid_sample_mask = valid_coins_per_timestamp >= self.hparams.portfolio_size
         all_valid_sample_indices = np.where(valid_sample_mask)[0]
+
         if len(all_valid_sample_indices) == 0:
             raise ValueError(
                 f"No timestamps found with at least {self.hparams.portfolio_size} valid coins."
