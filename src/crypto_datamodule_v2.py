@@ -13,40 +13,38 @@ from numba import jit
 from torch.utils.data import Dataset, DataLoader
 from lightning import LightningDataModule
 from typing import Optional, Dict, Any, List, Tuple
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    BarColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
 # --- Constants ---
 warnings.simplefilter("ignore", category=RuntimeWarning)
 pd.options.mode.chained_assignment = None
 
-# --- Numba Accelerated Functions ---
+# ========================================================================
+# 1. STANDALONE DATA PROCESSING PIPELINE
+# (Các hàm này không thay đổi - chúng đã đúng)
+# ========================================================================
 
 
 @jit(nopython=True)
 def _calculate_labels_numba(
-    close_prices: np.ndarray, barrier_up: float, barrier_down: float, horizon: int
+    close_prices: np.ndarray,
+    atr_values: np.ndarray,
+    barrier_atr_multiplier: float,
+    horizon: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Calculates the trade and direction labels using the triple barrier method.
-    """
     n = len(close_prices)
     labels_trade = np.zeros(n, dtype=np.bool_)
     labels_dir = np.zeros(n, dtype=np.bool_)
-
     for i in range(n - 1):
         entry_price = close_prices[i]
-        upper_barrier = entry_price * (1 + barrier_up)
-        lower_barrier = entry_price * (1 - barrier_down)
-
+        atr = atr_values[i]
+        if np.isnan(atr) or atr <= 0:
+            continue
+        barrier_distance = atr * barrier_atr_multiplier
+        upper_barrier = entry_price + barrier_distance
+        lower_barrier = entry_price - barrier_distance
         end_idx = min(i + 1 + horizon, n)
-
         for j in range(i + 1, end_idx):
             if close_prices[j] >= upper_barrier:
                 labels_trade[i] = True
@@ -56,54 +54,194 @@ def _calculate_labels_numba(
                 labels_trade[i] = True
                 labels_dir[i] = False
                 break
-
     return labels_trade, labels_dir
 
 
-# --- Dataset Class (Minimalist) ---
+def load_single_coin_data(
+    data_dir: Path, coin: str, end_date: pd.Timestamp
+) -> Optional[pd.DataFrame]:
+    filename = f"{coin.lower()}.parquet"
+    filepath = data_dir / "data" / filename
+    if not filepath.exists():
+        return None
+    df = pd.read_parquet(filepath)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[df["date"] <= end_date]
+    if df.empty:
+        return None
+    return df[["date", "open", "high", "low", "close", "volume"]].copy()
 
-# Feature configuration with normalization types:
-# norm_type: 0 = no normalization, 1 = own mean/std, 2 = close's mean/std
+
+def process_coin_numpy_optimized(
+    df_raw: pd.DataFrame,
+    feature_names: List[str],
+    barrier_atr_multiplier: float,
+    barrier_horizon: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    open_p = df_raw["open"].values
+    high_p = df_raw["high"].values
+    low_p = df_raw["low"].values
+    close_p = df_raw["close"].values
+    volume = df_raw["volume"].values
+    dates = df_raw["date"].values
+    cols = {
+        "open": open_p,
+        "high": high_p,
+        "low": low_p,
+        "close": close_p,
+        "volume": volume,
+    }
+    cols["log_return"] = np.log(close_p / (np.roll(close_p, 1) + 1e-8)).astype(
+        np.float32
+    )
+    cols["sar"] = talib.SAR(high_p, low_p).astype(np.float32)
+    bb_upper, _, bb_lower = talib.BBANDS(close_p, timeperiod=20)
+    cols["bb_upper"] = bb_upper.astype(np.float32)
+    cols["bb_lower"] = bb_lower.astype(np.float32)
+    cols["adx"] = (talib.ADX(high_p, low_p, close_p, timeperiod=14) / 50.0).astype(
+        np.float32
+    ) - 1.0
+    cols["rsi"] = (talib.RSI(close_p, timeperiod=14) / 50.0).astype(np.float32) - 1.0
+    stoch_k, stoch_d = talib.STOCH(high_p, low_p, close_p)
+    cols["stoch_k"] = (stoch_k / 50.0).astype(np.float32) - 1.0
+    cols["stoch_d"] = (stoch_d / 50.0).astype(np.float32) - 1.0
+    cci_raw = talib.CCI(high_p, low_p, close_p, timeperiod=14)
+    cols["cci"] = (np.clip(cci_raw, -200, 200) / 200.0).astype(np.float32)
+    cols["mfi"] = (
+        talib.MFI(high_p, low_p, close_p, volume, timeperiod=14) / 50.0
+    ).astype(np.float32) - 1.0
+    roc_raw = talib.ROC(close_p, timeperiod=10)
+    cols["roc"] = (np.clip(roc_raw, -20, 20) / 20.0).astype(np.float32)
+    cols["cmf"] = pta.cmf(
+        df_raw["high"], df_raw["low"], df_raw["close"], df_raw["volume"], length=20
+    ).values.astype(np.float32)
+    macd, macd_signal, _ = talib.MACD(close_p)
+    cols["macd"] = macd.astype(np.float32)
+    cols["macd_signal"] = macd_signal.astype(np.float32)
+    cols["ema_20"] = talib.EMA(close_p, timeperiod=20).astype(np.float32)
+    cols["ema_50"] = talib.EMA(close_p, timeperiod=50).astype(np.float32)
+    cols["sma_20"] = talib.SMA(close_p, timeperiod=20).astype(np.float32)
+    cols["sma_50"] = talib.SMA(close_p, timeperiod=50).astype(np.float32)
+    cols["obv"] = talib.OBV(close_p, volume).astype(np.float32)
+    cols["atr"] = talib.ATR(high_p, low_p, close_p, timeperiod=14).astype(np.float32)
+    cols["candle_range"] = ((high_p - low_p) / (open_p + 1e-8)).astype(np.float32)
+    cols["candle_body_pct"] = (
+        np.abs(close_p - open_p) / (high_p - low_p + 1e-8)
+    ).astype(np.float32)
+    cols["candle_wick_pct"] = (
+        (high_p - np.maximum(open_p, close_p)) / (high_p - low_p + 1e-8)
+    ).astype(np.float32)
+    cols["temporal_sin"] = np.sin(
+        2 * np.pi * df_raw["date"].dt.hour / 24.0
+    ).values.astype(np.float32)
+    cols["temporal_cos"] = np.cos(
+        2 * np.pi * df_raw["date"].dt.hour / 24.0
+    ).values.astype(np.float32)
+    labels_trade, labels_dir = _calculate_labels_numba(
+        close_p, cols["atr"], barrier_atr_multiplier, barrier_horizon
+    )
+    cols["label_trade"] = labels_trade
+    cols["label_dir"] = labels_dir
+
+    # convert open, high, low, close, volume to float32
+    cols["open"] = cols["open"].astype(np.float32)
+    cols["high"] = cols["high"].astype(np.float32)
+    cols["low"] = cols["low"].astype(np.float32)
+    cols["close"] = cols["close"].astype(np.float32)
+    cols["volume"] = cols["volume"].astype(np.float32)
+
+    df = pd.DataFrame(cols, index=dates)
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    feature_df = df[feature_names]
+    feature_df = feature_df.ffill().bfill().fillna(0)
+    features_array = feature_df.values.astype(np.float32)
+    labels_trade_array = df["label_trade"].values.astype(np.bool_)
+    labels_dir_array = df["label_dir"].values.astype(np.bool_)
+    return (dates, features_array, labels_trade_array, labels_dir_array)
+
+
+def process_coin_job(
+    coin_info: Tuple[int, str],
+    data_dir: Path,
+    end_date: pd.Timestamp,
+    date_to_idx_map: Dict[pd.Timestamp, int],
+    feature_names: List[str],
+    barrier_atr_multiplier: float,
+    barrier_horizon: int,
+) -> Optional[Tuple]:
+    coin_idx, coin = coin_info
+    try:
+        df_raw = load_single_coin_data(data_dir, coin, end_date)
+        if df_raw is None:
+            return None
+        (dates, features_array, labels_trade_array, labels_dir_array) = (
+            process_coin_numpy_optimized(
+                df_raw, feature_names, barrier_atr_multiplier, barrier_horizon
+            )
+        )
+        master_indices, df_indices = [], []
+        for i, date in enumerate(dates):
+            if date in date_to_idx_map:
+                master_indices.append(date_to_idx_map[date])
+                df_indices.append(i)
+        if not master_indices:
+            return None
+        valid_features = features_array[df_indices].astype(np.float32)
+        labels_trade = labels_trade_array[df_indices]
+        labels_dir = labels_dir_array[df_indices]
+        local_indices_for_map = np.arange(len(df_indices), dtype=np.int32)
+        return (
+            coin_idx,
+            valid_features,
+            master_indices,
+            local_indices_for_map,
+            labels_trade,
+            labels_dir,
+        )
+    except Exception as e:
+        print(f"[Warning] Error processing {coin} (idx {coin_idx}): {e}")
+        return None
+
+
+# ========================================================================
+# 2. DATA STRUCTURES (Config & Dataset)
+# ========================================================================
+
 FEATURE_CONFIG = {
-    "open": {"norm_type": 2},  # Normalize with close
-    "high": {"norm_type": 2},  # Normalize with close
-    "low": {"norm_type": 2},  # Normalize with close
-    "close": {"norm_type": 2},  # Normalize with own (close)
-    "sar": {"norm_type": 2},  # Normalize with close
-    "bb_upper": {"norm_type": 2},  # Normalize with close
-    "bb_lower": {"norm_type": 2},  # Normalize with close
-    "atr": {"norm_type": 1},  # Normalize with own
-    "macd": {"norm_type": 1},  # Normalize with own
-    "macd_signal": {"norm_type": 1},  # Normalize with own
-    "volume": {"norm_type": 1},  # Normalize with own
-    "obv": {"norm_type": 1},  # Normalize with own
-    "rsi": {"norm_type": 0},  # No norm (pre-norm only: 0-100)
-    "stoch_k": {"norm_type": 0},  # No norm (pre-norm only: 0-100)
-    "stoch_d": {"norm_type": 0},  # No norm (pre-norm only: 0-100)
-    "cci": {"norm_type": 0},  # No norm (pre-norm only: -200-200)
-    "mfi": {"norm_type": 0},  # No norm (pre-norm only: 0-100)
-    "adx": {"norm_type": 0},  # No norm (pre-norm only: 0-100)
-    "cmf": {"norm_type": 0},  # No norm (already -1 to 1)
-    "roc": {"norm_type": 0},  # No norm (pre-norm only: -20-20)
-    "sma_20": {"norm_type": 2},  # Normalize with close
-    "sma_50": {"norm_type": 2},  # Normalize with close
-    "ema_20": {"norm_type": 2},  # Normalize with close
-    "ema_50": {"norm_type": 2},  # Normalize with close
-    "candle_range": {"norm_type": 0},  # No norm (percentage)
-    "candle_body_pct": {"norm_type": 0},  # No norm (percentage)
-    "candle_wick_pct": {"norm_type": 0},  # No norm (percentage)
-    "log_return": {"norm_type": 0},  # No norm (already centered)
-    "temporal_sin": {"norm_type": 0},  # No norm (already -1 to 1)
-    "temporal_cos": {"norm_type": 0},  # No norm (already -1 to 1)
+    "open": {"norm_type": 2},
+    "high": {"norm_type": 2},
+    "low": {"norm_type": 2},
+    "close": {"norm_type": 2},
+    "sar": {"norm_type": 2},
+    "bb_upper": {"norm_type": 2},
+    "bb_lower": {"norm_type": 2},
+    "atr": {"norm_type": 1},
+    "macd": {"norm_type": 1},
+    "macd_signal": {"norm_type": 1},
+    "volume": {"norm_type": 1},
+    "obv": {"norm_type": 1},
+    "rsi": {"norm_type": 0},
+    "stoch_k": {"norm_type": 0},
+    "stoch_d": {"norm_type": 0},
+    "cci": {"norm_type": 0},
+    "mfi": {"norm_type": 0},
+    "adx": {"norm_type": 0},
+    "cmf": {"norm_type": 0},
+    "roc": {"norm_type": 0},
+    "sma_20": {"norm_type": 2},
+    "sma_50": {"norm_type": 2},
+    "ema_20": {"norm_type": 2},
+    "ema_50": {"norm_type": 2},
+    "candle_range": {"norm_type": 0},
+    "candle_body_pct": {"norm_type": 0},
+    "candle_wick_pct": {"norm_type": 0},
+    "log_return": {"norm_type": 0},
+    "temporal_sin": {"norm_type": 0},
+    "temporal_cos": {"norm_type": 0},
 }
 
 
 class CryptoPortfolioDataset(Dataset):
-    """
-    A minimalist Dataset.
-    It only holds the indices of valid samples for a specific split (train/val).
-    """
-
     def __init__(self, sample_indices: np.ndarray):
         self.sample_indices = sample_indices
 
@@ -114,16 +252,12 @@ class CryptoPortfolioDataset(Dataset):
         return self.sample_indices[idx]
 
 
-# --- Data Module Class (Main Logic) ---
+# ========================================================================
+# 3. DATAMODULE ORCHESTRATOR
+# ========================================================================
 
 
 class CryptoDataModuleV2(LightningDataModule):
-    """
-    Manages all aspects of data loading, processing, and batching.
-    Optimized to process and align data in a streaming fashion to
-    avoid memory peaks.
-    """
-
     def __init__(
         self,
         data_dir: str = "./data/crypto-1200",
@@ -132,116 +266,65 @@ class CryptoDataModuleV2(LightningDataModule):
         candle_length: int = 40000,
         lookback_window: int = 64,
         portfolio_size: int = 64,
-        barrier_up: float = 0.02,
-        barrier_down: float = 0.02,
+        barrier_atr_multiplier: float = 2.0,
         barrier_horizon: int = 4,
         batch_size: int = 4,
         num_workers: int = 4,
         max_coins: int = -1,
         validation_coins: Optional[List[str]] = None,
     ):
-        """
-        Initializes the DataModule.
-
-        Args:
-            data_dir (str): Path to the merged data directory.
-            end_date (str): The final date to include in the dataset (YYYY-MM-DD).
-            validation_start_date (str): The date to split train and val sets.
-            candle_length (int): Fixed number of hours to create in the master
-                                 timestamp index, ending at `end_date`.
-            lookback_window (int): Number of historical candles (T) for the model.
-            portfolio_size (int): Number of coins (P) in each portfolio sample.
-            barrier_up (float): Upper barrier for label generation (+%).
-            barrier_down (float): Lower barrier for label generation (-%).
-            barrier_horizon (int): Lookahead period for label generation (in hours).
-            batch_size (int): Number of samples per batch (B).
-            num_workers (int): Number of parallel workers for data loading.
-            max_coins (int): Maximum number of coins to process (-1 means all coins).
-            validation_coins (Optional[List[str]]): List of coin names to use for validation.
-                                                    Must have exactly `portfolio_size` coins.
-                                                    If None, automatically selects coins with longest history.
-        """
         super().__init__()
         self.save_hyperparameters()
-
-        # --- Paths and Dates ---
-        self.data_dir = Path(data_dir)
-        self.end_date = pd.to_datetime(end_date, utc=True)
-        self.validation_start_date = pd.to_datetime(validation_start_date, utc=True)
-
-        # --- Feature & Label Config ---
-        self._setup_feature_config()
-
-        # --- Internal State ---
-        self.coins = []
-        self.master_timestamps = None
-        self.date_to_idx_map = {}
-        self.train_indices = None
-        self.val_indices = None
-
-        # --- Aligned Data (Large numpy arrays) ---
-        self.all_features_aligned = None
-        self.all_labels_trade_aligned = None
-        self.all_labels_dir_aligned = None
-        self.mask_aligned = None
-        self.val_coin_indices = None
-
-        self.coin_baselines = {}
-
-    def _setup_feature_config(self):
-        """
-        Defines the feature configuration.
-        No normalization logic - raw features will be used.
-        """
-        self.feature_config = FEATURE_CONFIG
-        self.feature_names = list(self.feature_config.keys())
+        self.data_dir = Path(self.hparams.data_dir)
+        self.end_date = pd.to_datetime(self.hparams.end_date, utc=True)
+        self.validation_start_date = pd.to_datetime(
+            self.hparams.validation_start_date, utc=True
+        )
+        self.feature_names = list(FEATURE_CONFIG.keys())
+        self.coins: List[str] = []
+        self.master_timestamps: np.ndarray = None
+        self.date_to_idx_map: Dict[pd.Timestamp, int] = {}
+        self.train_indices: np.ndarray = None
+        self.val_indices: np.ndarray = None
+        self.val_coin_indices: np.ndarray = None
+        self.coin_baselines: Dict[str, float] = {}
+        self.all_labels_trade_aligned: np.ndarray = None
+        self.all_labels_dir_aligned: np.ndarray = None
+        self.mask_aligned: np.ndarray = None
+        self.master_to_local_map_aligned: np.ndarray = None
+        self.features_per_coin: List[np.ndarray] = []
 
     def prepare_data(self):
         pass
 
     def setup(self, stage: Optional[str] = None):
         """
-        The main data processing pipeline. This runs on every GPU process.
-        1. Generate master timestamp index.
-        2. Initialize large, empty, shared arrays.
-        3. Load and process all coins in parallel, filling arrays directly.
-        4. Calculate the validity mask.
-        5. Determine sample indices and split train/val.
-        6. Identify fixed coins for validation.
+        Main setup: Runs parallel processing *before* allocating large arrays
+        to keep worker process memory small.
         """
-        if self.all_features_aligned is not None:
+        if self.master_to_local_map_aligned is not None:
             print("Data already set up.")
             return
 
-        print(f"--- Starting setup for stage: {stage} ---")
+        print(f"--- Starting setup (stage: {stage}) ---")
 
+        # --- 0. Load Metadata ---
         metadata_path = self.data_dir / "metadata.json"
         if not metadata_path.exists():
             raise FileNotFoundError(f"metadata.json not found in {self.data_dir}")
-
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
-            self.coins = list(metadata["coins"].keys())
-
-            # sort coins by duration days
-            self.coins = sorted(
-                self.coins,
-                key=lambda x: metadata["coins"][x]["duration_days"],
-                reverse=True,
-            )
-            print(f"Loaded {len(self.coins)} coins from metadata.")
-
-        # Apply max_coins limit
-        if self.hparams.max_coins > 0 and len(self.coins) > self.hparams.max_coins:
-            self.coins = self.coins[: self.hparams.max_coins]
-            print(
-                f"Limited to {len(self.coins)} coins (max_coins={self.hparams.max_coins})"
-            )
-
-        # --- 1. Generate Master Timestamps ---
-        print(
-            f"Generating {self.hparams.candle_length} master timestamps ending at {self.end_date}..."
+        self.coins = sorted(
+            metadata["coins"].keys(),
+            key=lambda x: metadata["coins"][x]["duration_days"],
+            reverse=True,
         )
+        if self.hparams.max_coins > 0:
+            self.coins = self.coins[: self.hparams.max_coins]
+        n_coins = len(self.coins)
+        print(f"Loaded and limited to {n_coins} coins.")
+
+        # --- 1. Create Master Timestamps ---
         self.master_timestamps = pd.date_range(
             end=self.end_date,
             periods=self.hparams.candle_length,
@@ -252,249 +335,88 @@ class CryptoDataModuleV2(LightningDataModule):
             date: i for i, date in enumerate(self.master_timestamps)
         }
         n_timestamps = len(self.master_timestamps)
-        n_coins = len(self.coins)
-        n_features = len(self.feature_names)
-        print(f"Master timestamps created (Total: {n_timestamps})")
 
-        # --- 2. Initialize large aligned arrays (fill with NaN) ---
-        self.all_features_aligned = np.full(
-            (n_coins, n_timestamps, n_features), np.nan, dtype=np.float32
+        # --- 2. "Map" Step: Run parallel jobs ---
+        # We run this *before* creating large arrays.
+        # The main process memory is small, so worker
+        # processes will also be small.
+        jobs = list(enumerate(self.coins))
+        print(f"Starting parallel processing for {n_coins} coins...")
+
+        results = Parallel(n_jobs=-1, backend="multiprocessing")(
+            delayed(process_coin_job)(
+                coin_info,
+                self.data_dir,
+                self.end_date,
+                self.date_to_idx_map,
+                self.feature_names,
+                self.hparams.barrier_atr_multiplier,
+                self.hparams.barrier_horizon,
+            )
+            for coin_info in tqdm(jobs, desc="Processing coins")
         )
+
+        print("Parallel processing complete. Initializing arrays...")
+
+        # --- 3. Initialize Data Holders ---
+        # Now that parallel step is done, we allocate memory
+        # in the main process.
         self.all_labels_trade_aligned = np.full(
             (n_coins, n_timestamps), False, dtype=np.bool_
         )
         self.all_labels_dir_aligned = np.full(
             (n_coins, n_timestamps), False, dtype=np.bool_
         )
-
-        # --- 3. Process all coins in parallel and fill arrays ---
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeRemainingColumn(),
-            TimeElapsedColumn(),
-            transient=True,
+        self.mask_aligned = np.full((n_coins, n_timestamps), False, dtype=np.bool_)
+        self.master_to_local_map_aligned = np.full(
+            (n_coins, n_timestamps), -1, dtype=np.int32
         )
+        self.features_per_coin = [None] * n_coins
 
-        with progress:
-            task_process = progress.add_task(
-                f"Processing {n_coins} coins", total=n_coins
+        # --- 4. "Reduce" Step: Fill arrays from job results ---
+        # This will temporarily double memory, but only in the main process.
+        print("Filling arrays (Reduce step)...")
+        for result in results:
+            if result is None:
+                continue
+
+            (
+                coin_idx,
+                valid_features,
+                master_indices,
+                local_indices_map,
+                labels_trade,
+                labels_dir,
+            ) = result
+
+            self.all_labels_trade_aligned[coin_idx, master_indices] = labels_trade
+            self.all_labels_dir_aligned[coin_idx, master_indices] = labels_dir
+            self.mask_aligned[coin_idx, master_indices] = True
+            self.features_per_coin[coin_idx] = valid_features
+            self.master_to_local_map_aligned[coin_idx, master_indices] = (
+                local_indices_map
             )
 
-            # Process coins sequentially (no multi-threading)
-            for coin_idx, coin in enumerate(self.coins):
-                self._process_and_fill(coin_idx, coin)
-                progress.update(task_process, advance=1)
-
-        print("Data processing and alignment complete.")
+        print("Data filling complete.")
+        del results  # Free the large intermediate list
         gc.collect()
 
-        # --- 4. Calculate validity mask ---
+        # --- 5. Post-processing ---
         self._calculate_validity_mask()
-
-        # --- 5. Determine sample indices and split ---
         self._find_samples_and_split()
-
-        # --- 6. Identify validation coins ---
         self._find_validation_coins()
-
-        # --- 7. Calculate coin baselines ---
         self._calculate_coin_baselines()
 
         print(f"--- Setup complete ---")
         print(f"  Total valid train samples: {len(self.train_indices):,}")
         print(f"  Total valid val samples: {len(self.val_indices):,}")
-        print(
-            f"  Validation coins (P={self.hparams.portfolio_size}): {self.val_coin_names}"
-        )
-
-        # Print date ranges for train and validation
-        if len(self.train_indices) > 0:
-            train_start_idx = np.min(self.train_indices)
-            train_end_idx = np.max(self.train_indices)
-            train_start_date = pd.to_datetime(self.master_timestamps[train_start_idx])
-            train_end_date = pd.to_datetime(self.master_timestamps[train_end_idx])
-            train_days = (train_end_date - train_start_date).days
-            print(
-                f"  Train date range: {train_start_date} to {train_end_date} ({train_days} days)"
-            )
-
-        if len(self.val_indices) > 0:
-            val_start_idx = np.min(self.val_indices)
-            val_end_idx = np.max(self.val_indices)
-            val_start_date = pd.to_datetime(self.master_timestamps[val_start_idx])
-            val_end_date = pd.to_datetime(self.master_timestamps[val_end_idx])
-            val_days = (val_end_date - val_start_date).days
-            print(
-                f"  Val date range: {val_start_date} to {val_end_date} ({val_days} days)"
-            )
-
-    def _load_single_coin_data(self, coin: str) -> Optional[pd.DataFrame]:
-        """Loads 1h data, truncates to end_date."""
-        filename = f"{coin.lower()}.parquet"
-        filepath = self.data_dir / "data" / filename
-
-        if not filepath.exists():
-            return None
-
-        df = pd.read_parquet(filepath)
-        df["date"] = pd.to_datetime(df["date"])
-
-        # Filter by end date
-        df = df[df["date"] <= self.end_date]
-
-        if df.empty:
-            return None
-
-        return df[["date", "open", "high", "low", "close", "volume"]].copy()
-
-    def _process_and_fill(self, coin_idx: int, coin: str):
-        """
-        Loads data, calls the optimized processing worker,
-        and fills the shared numpy arrays directly.
-        """
-        try:
-            df_raw = self._load_single_coin_data(coin)
-            if df_raw is None:
-                return
-
-            (
-                dates,
-                features_array,
-                labels_trade_array,
-                labels_dir_array,
-            ) = self._process_coin_numpy_optimized(df_raw)
-
-            master_indices = [
-                self.date_to_idx_map[date]
-                for date in dates
-                if date in self.date_to_idx_map
-            ]
-            df_indices = [
-                i for i, date in enumerate(dates) if date in self.date_to_idx_map
-            ]
-
-            if not master_indices:
-                return
-
-            self.all_features_aligned[coin_idx, master_indices, :] = features_array[
-                df_indices
-            ]
-            self.all_labels_trade_aligned[coin_idx, master_indices] = (
-                labels_trade_array[df_indices]
-            )
-            self.all_labels_dir_aligned[coin_idx, master_indices] = labels_dir_array[
-                df_indices
-            ]
-
-        except Exception as e:
-            print(f"Error processing {coin} (idx {coin_idx}): {e}")
-            return
-
-    def _process_coin_numpy_optimized(
-        self, df_raw: pd.DataFrame
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Calculates all features and labels using raw values (no normalization).
-        """
-        open_p = df_raw["open"].values
-        high_p = df_raw["high"].values
-        low_p = df_raw["low"].values
-        close_p = df_raw["close"].values
-        volume = df_raw["volume"].values
-        dates = df_raw["date"].values
-
-        cols = {
-            "open": open_p,
-            "high": high_p,
-            "low": low_p,
-            "close": close_p,
-            "volume": volume,
-        }
-
-        cols["log_return"] = np.log(close_p / (np.roll(close_p, 1) + 1e-8))
-        cols["sar"] = talib.SAR(high_p, low_p)
-        cols["bb_upper"], cols["bb_middle"], cols["bb_lower"] = talib.BBANDS(
-            close_p, timeperiod=20
-        )
-
-        # Pre-normalize bounded indicators to [-1, 1] range
-        cols["adx"] = (
-            talib.ADX(high_p, low_p, close_p, timeperiod=14) / 50.0
-        ) - 1.0  # [0,100] -> [-1,1]
-        cols["rsi"] = (
-            talib.RSI(close_p, timeperiod=14) / 50.0
-        ) - 1.0  # [0,100] -> [-1,1]
-        stoch_k, stoch_d = talib.STOCH(high_p, low_p, close_p)
-        cols["stoch_k"] = (stoch_k / 50.0) - 1.0  # [0,100] -> [-1,1]
-        cols["stoch_d"] = (stoch_d / 50.0) - 1.0  # [0,100] -> [-1,1]
-        cci_raw = talib.CCI(high_p, low_p, close_p, timeperiod=14)
-        cols["cci"] = np.clip(cci_raw, -200, 200) / 200.0  # [-200,200] -> [-1,1]
-        cols["mfi"] = (
-            talib.MFI(high_p, low_p, close_p, volume, timeperiod=14) / 50.0
-        ) - 1.0  # [0,100] -> [-1,1]
-        roc_raw = talib.ROC(close_p, timeperiod=10)
-        cols["roc"] = np.clip(roc_raw, -20, 20) / 20.0  # [-20,20] -> [-1,1]
-
-        df_temp = df_raw.set_index("date")
-        cols["cmf"] = pta.cmf(
-            df_temp["high"],
-            df_temp["low"],
-            df_temp["close"],
-            df_temp["volume"],
-            length=20,
-        ).values
-
-        cols["macd"], cols["macd_signal"], cols["macd_hist"] = talib.MACD(close_p)
-        cols["ema_20"] = talib.EMA(close_p, timeperiod=20)
-        cols["ema_50"] = talib.EMA(close_p, timeperiod=50)
-        cols["sma_20"] = talib.SMA(close_p, timeperiod=20)
-        cols["sma_50"] = talib.SMA(close_p, timeperiod=50)
-        cols["obv"] = talib.OBV(close_p, volume)
-        cols["atr"] = talib.ATR(high_p, low_p, close_p, timeperiod=14)
-
-        cols["candle_range"] = (high_p - low_p) / (open_p + 1e-8)
-        cols["candle_body_pct"] = np.abs(close_p - open_p) / (high_p - low_p + 1e-8)
-        cols["candle_wick_pct"] = (high_p - np.maximum(open_p, close_p)) / (
-            high_p - low_p + 1e-8
-        )
-        cols["temporal_sin"] = np.sin(2 * np.pi * df_raw["date"].dt.hour / 24.0).values
-        cols["temporal_cos"] = np.cos(2 * np.pi * df_raw["date"].dt.hour / 24.0).values
-
-        labels_trade, labels_dir = _calculate_labels_numba(
-            close_p,
-            self.hparams.barrier_up,
-            self.hparams.barrier_down,
-            self.hparams.barrier_horizon,
-        )
-        cols["label_trade"] = labels_trade
-        cols["label_dir"] = labels_dir
-
-        df = pd.DataFrame(cols, index=dates)
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df = df.ffill().bfill().fillna(0)
-
-        features_array = df[self.feature_names].values.astype(np.float32)
-        labels_trade_array = df["label_trade"].values.astype(np.bool_)
-        labels_dir_array = df["label_dir"].values.astype(np.bool_)
-
-        return (
-            dates,
-            features_array,
-            labels_trade_array,
-            labels_dir_array,
-        )
 
     def _calculate_validity_mask(self):
         """
-        Calculates a boolean mask (n_coins, n_timestamps) indicating
-        which (coin, time) pairs are valid for sampling.
+        Updates the `mask_aligned` to only include timesteps
+        that have a full lookback window.
         """
-        close_idx = self.feature_names.index("close")
-        history_mask = ~np.isnan(self.all_features_aligned[:, :, close_idx])
-
+        history_mask = self.mask_aligned  # True where data exists
         history_counts = bn.move_sum(
             history_mask.astype(np.int8),
             window=self.hparams.lookback_window,
@@ -505,98 +427,54 @@ class CryptoDataModuleV2(LightningDataModule):
         self.mask_aligned = history_mask & valid_lookback
 
     def _calculate_coin_baselines(self):
-        """
-        Calculates the positive rate (baseline AP) for each coin
-        using only valid training samples.
-        """
+        """Calculates the positive trade rate (baseline) for each coin."""
         print("Calculating coin baselines from training data...")
         if self.train_indices is None or len(self.train_indices) == 0:
-            print("No training indices found. Skipping baseline calculation.")
             self.coin_baselines = {coin: 0.0 for coin in self.coins}
             return
-
         n_coins = len(self.coins)
         n_timestamps = len(self.master_timestamps)
-
-        # 1. Lấy các chỉ số training duy nhất
         unique_train_indices = np.unique(self.train_indices)
-
-        # 2. Tạo một mặt nạ cho biết đâu là sample training
-        # (T)
         train_mask_full = np.zeros(n_timestamps, dtype=bool)
         train_mask_full[unique_train_indices] = True
-
-        # 3. Kết hợp với mặt nạ hợp lệ (validity mask)
-        # (C, T) & (1, T) -> (C, T)
         valid_train_mask = self.mask_aligned & train_mask_full[None, :]
-
-        # 4. Tính toán cho từng coin
-        # Lấy nhãn của các sample positive VÀ hợp lệ trong tập train
         n_positive_trades = np.sum(
             self.all_labels_trade_aligned & valid_train_mask, axis=1
         )
-        # Lấy tổng số sample hợp lệ trong tập train
         n_total_valid_samples = np.sum(valid_train_mask, axis=1)
-
-        # 5. Tính baseline (tỉ lệ positive), xử lý chia cho 0
         baselines = np.divide(
             n_positive_trades,
             n_total_valid_samples,
-            out=np.full(n_coins, np.nan),  # Trả về NaN nếu không có sample
+            out=np.full(n_coins, np.nan),
             where=n_total_valid_samples > 0,
         )
-
-        # 6. Lưu trữ vào dictionary
         self.coin_baselines = {
             self.coins[i]: (baselines[i] if not np.isnan(baselines[i]) else 0.0)
             for i in range(n_coins)
         }
 
-        # In ra một vài ví dụ
-        print("Coin baselines calculated (sample):")
-        if self.val_coin_names:
-            for i, coin in enumerate(self.val_coin_names[:5]):
-                print(f"  {coin}: {self.coin_baselines.get(coin, 0.0):.4f}")
-        else:
-            print(" (No val_coin_names to display sample)")
-
     def _find_samples_and_split(self):
         """
-        Finds all timestamps that have at least `portfolio_size` valid coins.
-        Splits these valid timestamps into train and validation sets.
-
-        Applies oversampling to train timestamps based on coin availability
-        as per the user's request.
+        Finds all valid timestamp indices (>= P coins)
+        and splits them into train/val sets.
         """
-        # Tính toán số lượng coin hợp lệ cho mỗi timestamp
         valid_coins_per_timestamp = np.sum(self.mask_aligned, axis=0)
-
-        # Tìm các timestamp có đủ coin (>= portfolio_size)
         valid_sample_mask = valid_coins_per_timestamp >= self.hparams.portfolio_size
         all_valid_sample_indices = np.where(valid_sample_mask)[0]
-
         if len(all_valid_sample_indices) == 0:
             raise ValueError(
                 f"No timestamps found with at least {self.hparams.portfolio_size} valid coins."
             )
 
-        # Xác định chỉ số bắt đầu của tập validation
         val_start_idx = np.searchsorted(
             self.master_timestamps,
-            np.datetime64(self.validation_start_date),
+            self.validation_start_date.to_datetime64(),
             side="left",
         )
-
-        # Chia các chỉ số (indices) *duy nhất* thành train và val
         val_mask = all_valid_sample_indices >= val_start_idx
-        train_mask = ~val_mask
+        unique_train_indices = all_valid_sample_indices[~val_mask]
+        self.val_indices = all_valid_sample_indices[val_mask]
 
-        unique_train_indices = all_valid_sample_indices[train_mask]
-        self.val_indices = all_valid_sample_indices[
-            val_mask
-        ]  # Val indices giữ nguyên, không lặp lại
-
-        # Kiểm tra xem có sample nào không
         if len(unique_train_indices) == 0:
             raise ValueError(
                 "No training samples found. Adjust `validation_start_date`."
@@ -606,228 +484,172 @@ class CryptoDataModuleV2(LightningDataModule):
                 "No validation samples found. Adjust `validation_start_date`."
             )
 
-        # --- BẮT ĐẦU THAY ĐỔI ---
-        # Áp dụng oversampling cho train_indices theo công thức
-
-        # 1. Lấy số lượng coin hợp lệ cho từng timestamp trong tập train
         n_valid_coins_at_train_indices = valid_coins_per_timestamp[unique_train_indices]
-
-        # 2. Tính số lần lặp lại cho mỗi timestamp
         n_repeats = np.ceil(
             n_valid_coins_at_train_indices / self.hparams.portfolio_size
         ).astype(np.intp)
-
-        # Đảm bảo số lần lặp lại ít nhất là 1
-        n_repeats = np.maximum(n_repeats, 1).astype(np.intp)
-
-        # 3. Tạo ra mảng train_indices mới đã được lặp lại
+        n_repeats = np.maximum(n_repeats, 1)
         self.train_indices = np.repeat(unique_train_indices, n_repeats)
+
+    # --- Validation Coin Selection (Refactored) ---
 
     def _find_validation_coins(self):
         """
-        Sets validation coins based on the provided parameter or automatically
-        selects the P coins with the longest history.
-
-        If validation_coins is provided:
-        - Filters out non-existent coins (with warning)
-        - If insufficient coins (< portfolio_size), automatically fills with best available coins
-        - If excess coins (> portfolio_size), keeps only portfolio_size coins
-        - Validates that final coins have valid data at all validation timestamps
+        Orchestrates the selection of a fixed validation coin portfolio.
         """
-        validation_coins = self.hparams.validation_coins
-
-        if validation_coins is not None:
-            # Filter out non-existent coins
-            coins_set = set(self.coins)
-            existing_coins = [coin for coin in validation_coins if coin in coins_set]
-            missing_coins = [coin for coin in validation_coins if coin not in coins_set]
-
-            if missing_coins:
-                warnings.warn(
-                    f"The following validation coins do not exist in the dataset and will be ignored: {missing_coins}",
-                    UserWarning,
-                )
-
-            coin_to_idx = {coin: idx for idx, coin in enumerate(self.coins)}
-            selected_indices = []
-
-            # Add existing coins from validation_coins
-            for coin in existing_coins:
-                selected_indices.append(coin_to_idx[coin])
-
-            # Remove duplicates while preserving order
-            seen = set()
-            selected_indices = [
-                idx for idx in selected_indices if not (idx in seen or seen.add(idx))
-            ]
-
-            # Filter out coins that don't have valid data at validation timestamps
-            if len(self.val_indices) > 0:
-                valid_at_val_indices = []
-                for coin_idx in selected_indices:
-                    # Check if coin is valid at all validation timestamps
-                    is_valid = np.all(self.mask_aligned[coin_idx, self.val_indices])
-                    if is_valid:
-                        valid_at_val_indices.append(coin_idx)
-                    else:
-                        coin_name = self.coins[coin_idx]
-                        warnings.warn(
-                            f"Validation coin '{coin_name}' does not have valid data at all validation timestamps and will be ignored",
-                            UserWarning,
-                        )
-                selected_indices = valid_at_val_indices
-
-            # If we need more coins, fill with best available coins
-            if len(selected_indices) < self.hparams.portfolio_size:
-                needed = self.hparams.portfolio_size - len(selected_indices)
-
-                # Calculate score for each coin: number of valid samples at validation timestamps
-                candidate_scores = {}
-                for coin_idx in range(len(self.coins)):
-                    if coin_idx in selected_indices:
-                        continue  # Skip already selected coins
-
-                    # Only consider coins that are valid at all validation timestamps
-                    if len(self.val_indices) > 0:
-                        is_valid = np.all(self.mask_aligned[coin_idx, self.val_indices])
-                        if not is_valid:
-                            continue  # Skip coins without valid data at all validation timestamps
-                        # Score based on valid samples at validation timestamps
-                        score = np.sum(self.mask_aligned[coin_idx, self.val_indices])
-                        candidate_scores[coin_idx] = score
-                    else:
-                        # Fallback to total valid samples
-                        score = np.sum(self.mask_aligned[coin_idx, :])
-                        candidate_scores[coin_idx] = score
-
-                # Sort by score and take top needed coins
-                sorted_candidates = sorted(
-                    candidate_scores.items(), key=lambda x: x[1], reverse=True
-                )
-
-                added_count = 0
-                for coin_idx, score in sorted_candidates:
-                    if added_count >= needed:
-                        break
-                    selected_indices.append(coin_idx)
-                    coin_name = self.coins[coin_idx]
-                    print(f"Auto-added validation coin '{coin_name}' (score: {score})")
-                    added_count += 1
-
-                # If still not enough coins, warn and use what we have
-                if len(selected_indices) < self.hparams.portfolio_size:
-                    warnings.warn(
-                        f"Only {len(selected_indices)} valid coins available for validation portfolio "
-                        f"(requested {self.hparams.portfolio_size}). Using available coins.",
-                        UserWarning,
-                    )
-
-            # If we have too many coins, keep only portfolio_size best ones
-            elif len(selected_indices) > self.hparams.portfolio_size:
-                # Score coins based on valid samples at validation timestamps
-                coin_scores = []
-                for coin_idx in selected_indices:
-                    if len(self.val_indices) > 0:
-                        score = np.sum(self.mask_aligned[coin_idx, self.val_indices])
-                    else:
-                        score = np.sum(self.mask_aligned[coin_idx, :])
-                    coin_scores.append((coin_idx, score))
-
-                # Sort by score and keep top portfolio_size
-                coin_scores.sort(key=lambda x: x[1], reverse=True)
-                selected_indices = [
-                    idx for idx, _ in coin_scores[: self.hparams.portfolio_size]
-                ]
-
-                removed_coins = [
-                    self.coins[idx]
-                    for idx, _ in coin_scores[self.hparams.portfolio_size :]
-                ]
-                warnings.warn(
-                    f"Too many validation coins provided. Keeping top {self.hparams.portfolio_size} coins. "
-                    f"Removed: {removed_coins}",
-                    UserWarning,
-                )
-
-            self.val_coin_indices = np.sort(np.array(selected_indices))
-            self.val_coin_names = [self.coins[i] for i in self.val_coin_indices]
-
-            print(
-                f"Final validation coins (P={len(self.val_coin_indices)}): {self.val_coin_names}"
-            )
+        P = self.hparams.portfolio_size
+        user_coins = self.hparams.validation_coins
+        if user_coins is not None:
+            selected_indices = self._get_user_provided_val_coins(user_coins)
+            selected_indices = self._filter_val_coins_by_availability(selected_indices)
+            selected_indices = self._fill_or_truncate_val_coins(selected_indices, P)
         else:
-            # Fallback to automatic selection (original behavior)
-            valid_samples_per_coin = np.sum(self.mask_aligned, axis=1)
-            top_p_coin_indices = np.argsort(valid_samples_per_coin)[
-                -self.hparams.portfolio_size :
-            ]
-            self.val_coin_indices = np.sort(top_p_coin_indices)
-            self.val_coin_names = [self.coins[i] for i in self.val_coin_indices]
+            selected_indices = self._get_auto_selected_val_coins(P)
+        self.val_coin_indices = np.sort(np.array(selected_indices))
+        self.val_coin_names = [self.coins[i] for i in self.val_coin_indices]
+        if len(self.val_coin_indices) < P:
+            warnings.warn(
+                f"Could only find {len(self.val_coin_indices)} coins for validation portfolio (P={P})."
+            )
+        print(
+            f"Final validation coins (P={len(self.val_coin_indices)}): {self.val_coin_names}"
+        )
+
+    def _get_user_provided_val_coins(self, user_coins: List[str]) -> List[int]:
+        """Parses the user-provided list of coin names into indices."""
+        coins_set = set(self.coins)
+        coin_to_idx = {coin: idx for idx, coin in enumerate(self.coins)}
+        existing_coins = [coin for coin in user_coins if coin in coins_set]
+        missing_coins = [coin for coin in user_coins if coin not in coins_set]
+        if missing_coins:
+            warnings.warn(f"Missing coins, ignored: {missing_coins}", UserWarning)
+        selected_indices = []
+        seen = set()
+        for coin in existing_coins:
+            idx = coin_to_idx[coin]
+            if idx not in seen:
+                seen.add(idx)
+                selected_indices.append(idx)
+        return selected_indices
+
+    def _filter_val_coins_by_availability(self, coin_indices: List[int]) -> List[int]:
+        """Filters a list of coin indices, keeping only those valid across all val timestamps."""
+        if len(self.val_indices) == 0:
+            return coin_indices
+        valid_indices = []
+        for coin_idx in coin_indices:
+            if np.all(self.mask_aligned[coin_idx, self.val_indices]):
+                valid_indices.append(coin_idx)
+            else:
+                warnings.warn(
+                    f"Coin '{self.coins[coin_idx]}' has missing data in val range, ignored.",
+                    UserWarning,
+                )
+        return valid_indices
+
+    def _fill_or_truncate_val_coins(
+        self, selected_indices: List[int], P: int
+    ) -> List[int]:
+        """Ensures the list of indices has exactly P coins."""
+        if len(selected_indices) < P:
+            candidate_scores = {}
+            for coin_idx in range(len(self.coins)):
+                if coin_idx in selected_indices:
+                    continue
+                if len(self.val_indices) > 0:
+                    if not np.all(self.mask_aligned[coin_idx, self.val_indices]):
+                        continue
+                    score = np.sum(self.mask_aligned[coin_idx, self.val_indices])
+                else:
+                    score = np.sum(self.mask_aligned[coin_idx, :])
+                candidate_scores[coin_idx] = score
+            sorted_candidates = sorted(
+                candidate_scores.items(), key=lambda x: x[1], reverse=True
+            )
+            for coin_idx, _ in sorted_candidates:
+                if len(selected_indices) >= P:
+                    break
+                selected_indices.append(coin_idx)
+        elif len(selected_indices) > P:
+            coin_scores = []
+            for coin_idx in selected_indices:
+                score = (
+                    np.sum(self.mask_aligned[coin_idx, self.val_indices])
+                    if len(self.val_indices) > 0
+                    else np.sum(self.mask_aligned[coin_idx, :])
+                )
+                coin_scores.append((coin_idx, score))
+            coin_scores.sort(key=lambda x: x[1], reverse=True)
+            selected_indices = [idx for idx, _ in coin_scores[:P]]
+            warnings.warn(f"Too many val coins, kept top {P}", UserWarning)
+        return selected_indices
+
+    def _get_auto_selected_val_coins(self, P: int) -> List[int]:
+        """Auto-selects the top P coins based on data availability."""
+        valid_samples_per_coin = np.sum(self.mask_aligned, axis=1)
+        top_p_coin_indices = np.argsort(valid_samples_per_coin)[-P:]
+        return list(top_p_coin_indices)
+
+    # --- Collate Function & DataLoaders ---
 
     def _create_collator(self, is_train: bool):
         """
-        Factory function to create the appropriate collate_fn for train or val.
+        Factory that creates the collate_fn.
         """
+        n_features = len(self.feature_names)
 
         def collate_fn(batch_timestamp_indices: List[int]) -> Dict[str, torch.Tensor]:
             B = len(batch_timestamp_indices)
             T = self.hparams.lookback_window
-
-            list_features = []
+            P = self.hparams.portfolio_size
+            F = n_features
+            batch_features = np.empty((B, P, T, F), dtype=np.float32)
             list_labels_trade = []
             list_labels_dir = []
             list_coin_ids = []
 
             for i, ts_idx in enumerate(batch_timestamp_indices):
                 if is_train:
-                    valid_coin_indices_at_time = np.where(self.mask_aligned[:, ts_idx])[
-                        0
-                    ]
+                    valid_coin_indices = np.where(self.mask_aligned[:, ts_idx])[0]
                     coin_indices = np.random.choice(
-                        valid_coin_indices_at_time,
-                        self.hparams.portfolio_size,
-                        replace=False,
+                        valid_coin_indices, P, replace=False
                     )
                     coin_indices.sort()
                 else:
                     coin_indices = self.val_coin_indices
 
-                    if not np.all(self.mask_aligned[coin_indices, ts_idx]):
-                        raise ValueError(
-                            f"No valid coins at time {ts_idx} for validation"
-                        )
+                master_idx_range = np.arange(ts_idx - T + 1, ts_idx + 1)
 
-                features_slice = self.all_features_aligned[
-                    coin_indices, (ts_idx - T + 1) : (ts_idx + 1), :
-                ]
-                labels_trade_slice = self.all_labels_trade_aligned[coin_indices, ts_idx]
-                labels_dir_slice = self.all_labels_dir_aligned[coin_indices, ts_idx]
+                for p_idx, coin_idx in enumerate(coin_indices):
+                    try:
+                        local_indices = self.master_to_local_map_aligned[
+                            coin_idx, master_idx_range
+                        ]
+                        features_slice = self.features_per_coin[coin_idx][
+                            local_indices, :
+                        ]
+                        batch_features[i, p_idx, :, :] = features_slice
+                    except (IndexError, TypeError):
+                        batch_features[i, p_idx, :, :] = 0.0
 
-                list_features.append(features_slice)
-                list_labels_trade.append(labels_trade_slice)
-                list_labels_dir.append(labels_dir_slice)
+                list_labels_trade.append(
+                    self.all_labels_trade_aligned[coin_indices, ts_idx]
+                )
+                list_labels_dir.append(
+                    self.all_labels_dir_aligned[coin_indices, ts_idx]
+                )
                 list_coin_ids.append(coin_indices)
-
-            batch_features = np.stack(list_features)
-            batch_labels_trade = np.stack(list_labels_trade)
-            batch_labels_dir = np.stack(list_labels_dir)
-
-            # (B, P) - coin indices for each sample
-            batch_coin_ids = torch.from_numpy(np.stack(list_coin_ids)).long()
 
             return {
                 "features": torch.from_numpy(batch_features),
-                "labels_trade": torch.from_numpy(batch_labels_trade),
-                "labels_dir": torch.from_numpy(batch_labels_dir),
-                "coin_ids": batch_coin_ids,
+                "labels_trade": torch.from_numpy(np.stack(list_labels_trade)),
+                "labels_dir": torch.from_numpy(np.stack(list_labels_dir)),
+                "coin_ids": torch.from_numpy(np.stack(list_coin_ids)).long(),
             }
 
         return collate_fn
 
-    # --- DataLoader Definitions ---
-
     def train_dataloader(self) -> DataLoader:
-        """Creates the training DataLoader."""
         dataset = CryptoPortfolioDataset(self.train_indices)
         return DataLoader(
             dataset,
@@ -840,7 +662,6 @@ class CryptoDataModuleV2(LightningDataModule):
         )
 
     def val_dataloader(self) -> DataLoader:
-        """Creates the validation DataLoader."""
         dataset = CryptoPortfolioDataset(self.val_indices)
         return DataLoader(
             dataset,
@@ -853,13 +674,4 @@ class CryptoDataModuleV2(LightningDataModule):
         )
 
     def test_dataloader(self) -> DataLoader:
-        """Creates the test DataLoader."""
-        dataset = CryptoPortfolioDataset(self.test_indices)
-        return DataLoader(
-            dataset,
-            batch_size=self.hparams.batch_size,
-            shuffle=False,
-            num_workers=self.hparams.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
+        raise NotImplementedError("Test dataloader is not implemented.")

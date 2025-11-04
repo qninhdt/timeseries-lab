@@ -13,7 +13,7 @@ from torchmetrics.classification import (
     PrecisionRecallCurve,
 )
 
-from crypto_datamodule import FEATURE_CONFIG, CryptoDataModule
+from crypto_datamodule_v2 import FEATURE_CONFIG
 from layers import Normalize
 from utils.augmentation import apply_augmentation
 
@@ -31,6 +31,7 @@ class TraderLitModule(LightningModule):
         use_augmentation: bool = True,
         aug_jitter_prob: float = 0.0,
         aug_scaling_prob: float = 0.0,
+        use_weighted_loss: bool = True,
     ) -> None:
         """
         Args:
@@ -41,8 +42,10 @@ class TraderLitModule(LightningModule):
             use_augmentation (bool): Enable data augmentation during training
             aug_jitter_prob (float): Probability of applying jitter augmentation
             aug_scaling_prob (float): Probability of applying scaling augmentation
+            use_weighted_loss (bool): Enable coin-specific weighted loss for training
         """
         super().__init__()
+        # save_hyperparameters sẽ tự động lấy use_weighted_loss
         self.save_hyperparameters(logger=False, ignore=["model"])
 
         n_features = len(FEATURE_CONFIG)
@@ -52,6 +55,9 @@ class TraderLitModule(LightningModule):
 
         # Normalization module will be initialized in setup()
         self.normalize = None
+
+        # Buffer để lưu trọng số loss, sẽ được khởi tạo trong setup()
+        self.register_buffer("coin_pos_weights", None)
 
         # Store boolean mask for features normalized with close (norm_type=2)
         self.close_norm_mask = None
@@ -140,8 +146,26 @@ class TraderLitModule(LightningModule):
 
         targets_float = targets.float()
 
-        # Simple BCE loss without weighting
-        loss = nn.functional.binary_cross_entropy_with_logits(logits, targets_float)
+        # --- THAY ĐỔI TÍNH TOÁN LOSS ---
+        if self.hparams.use_weighted_loss and self.training and coin_ids is not None:
+            if self.coin_pos_weights is None:
+                # Fallback nếu setup() chưa chạy (không nên xảy ra)
+                loss = nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets_float
+                )
+            else:
+                # self.coin_pos_weights có shape (C_total)
+                # coin_ids có shape (B, P)
+                # Lấy ra các trọng số tương ứng cho batch này
+                batch_pos_weights = self.coin_pos_weights[coin_ids]  # Shape (B, P)
+
+                loss = nn.functional.binary_cross_entropy_with_logits(
+                    logits, targets_float, pos_weight=batch_pos_weights
+                )
+        else:
+            # Logic cũ: Loss BCE không trọng số (dùng cho validation hoặc khi tắt weighted_loss)
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, targets_float)
+        # --- KẾT THÚC THAY ĐỔI ---
 
         # Get probabilities and binary predictions for metrics
         probs = torch.sigmoid(logits)  # (B, P)
@@ -191,6 +215,7 @@ class TraderLitModule(LightningModule):
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
+        # model_step sẽ tự động dùng loss không trọng số vì self.training là False
         loss, preds, probs, targets = self.model_step(batch, apply_augmentation=False)
 
         # Update metrics
@@ -282,20 +307,9 @@ class TraderLitModule(LightningModule):
                 # --- LOGIC MỚI: TẠO BẢNG AP (MODEL vs BASELINE) ---
                 datamodule = self.trainer.datamodule
 
-                # Lấy dictionary baseline từ datamodule
-                coin_baselines = getattr(datamodule, "coin_baselines", {})
-
                 num_coins = all_probs.shape[1]
-                val_coin_names = []
-
-                if (
-                    isinstance(datamodule, CryptoDataModule)
-                    and datamodule.val_coin_names is not None
-                    and len(datamodule.val_coin_names) == num_coins
-                ):
-                    val_coin_names = datamodule.val_coin_names
-                else:
-                    val_coin_names = [f"coin_{i}" for i in range(num_coins)]
+                coin_baselines = datamodule.coin_baselines  # Dict[str, float]
+                val_coin_names = datamodule.val_coin_names  # List of coin names
 
                 per_coin_ap_metric = BinaryAveragePrecision().to(self.device)
                 ap_table_data = []
@@ -342,15 +356,48 @@ class TraderLitModule(LightningModule):
         pass
 
     def setup(self, stage: str) -> None:
+        # Lấy datamodule
+        datamodule = self.trainer.datamodule
+
         # Instantiate model with correct max_coins from datamodule
         if self.model is None:
             n_features = len(FEATURE_CONFIG)
-            max_coins = (
-                len(self.trainer.datamodule.coins)
-                if hasattr(self.trainer.datamodule, "coins")
-                else 128
-            )
+            max_coins = len(datamodule.coins) if hasattr(datamodule, "coins") else 128
             self.model = self.model_class(n_features=n_features, max_coins=max_coins)
+
+        # --- THÊM LOGIC TÍNH TRỌNG SỐ ---
+        if self.hparams.use_weighted_loss and self.coin_pos_weights is None:
+            print("Calculating coin-specific positive weights for loss...")
+            if not hasattr(datamodule, "coins") or not hasattr(
+                datamodule, "coin_baselines"
+            ):
+                raise AttributeError(
+                    "DataModule must have 'coins' list and 'coin_baselines' dict to use weighted loss."
+                )
+
+            all_coin_names = datamodule.coins
+            baselines = datamodule.coin_baselines
+            n_coins = len(all_coin_names)
+
+            # Khởi tạo tensor trọng số
+            pos_weights = torch.ones(n_coins, dtype=torch.float32)
+
+            for i, coin_name in enumerate(all_coin_names):
+                # Lấy tỉ lệ positive (baseline)
+                p = baselines.get(coin_name, 0.5)  # Mặc định 0.5 (trọng số 1) nếu thiếu
+
+                # Tính trọng số = (1-p) / p
+                # Thêm epsilon để đảm bảo ổn định số học
+                epsilon = 1e-6
+                p_stable = np.clip(p, epsilon, 1.0 - epsilon)
+                pos_weights[i] = (1.0 - p_stable) / p_stable
+
+            # Đăng ký làm buffer để tự động chuyển sang device (GPU/CPU)
+            self.register_buffer("coin_pos_weights", pos_weights)
+            print(
+                f"Coin weights calculated and registered. Min: {pos_weights.min():.2f}, Max: {pos_weights.max():.2f}, Mean: {pos_weights.mean():.2f}"
+            )
+        # --- KẾT THÚC LOGIC TRỌNG SỐ ---
 
         # Initialize normalization module
         if self.normalize is None:

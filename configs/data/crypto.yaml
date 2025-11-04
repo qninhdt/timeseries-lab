@@ -3,9 +3,8 @@ data_dir: ${paths.data_dir}/crypto-1200
 end_date: 2025-09-29
 validation_start_date: 2025-01-01
 barrier_horizon: 4
-barrier_up: 0.02
-barrier_down: 0.02
-lookback_window: 64
+barrier_atr_multiplier: 2.0
+lookback_window: 128
 candle_length: 50000
 portfolio_size: 64
 max_coins: 128
