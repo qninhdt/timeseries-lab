@@ -1,7 +1,8 @@
-from typing import Any, Dict, Tuple, Type, Callable, List
+from typing import Any, Dict, Tuple, Type, List
 
 import torch
 import torch.nn as nn
+import numpy as np
 from lightning import LightningModule
 
 from torchmetrics import MeanMetric, MaxMetric
@@ -13,7 +14,8 @@ from torchmetrics.classification import (
 )
 
 from crypto_datamodule import FEATURE_CONFIG, CryptoDataModule
-from loss.binary_focal_loss import BinaryFocalLoss
+from layers import Normalize
+from utils.augmentation import apply_augmentation
 
 import wandb
 
@@ -26,8 +28,9 @@ class TraderLitModule(LightningModule):
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         compile: bool = False,
-        use_focal_loss: bool = False,
-        gamma: float = 2.0,
+        use_augmentation: bool = True,
+        aug_jitter_prob: float = 0.0,
+        aug_scaling_prob: float = 0.0,
     ) -> None:
         """
         Args:
@@ -35,9 +38,9 @@ class TraderLitModule(LightningModule):
             learning_rate (float): Learning rate for optimizer
             weight_decay (float): Weight decay for optimizer
             compile (bool): Enable torch.compile (PyTorch 2.0+ only)
-            use_focal_loss (bool): If True, use focal loss with alpha from class weights
-                                  If False, use BCE with class weights (default)
-            gamma (float): Focal loss gamma parameter (default: 2.0)
+            use_augmentation (bool): Enable data augmentation during training
+            aug_jitter_prob (float): Probability of applying jitter augmentation
+            aug_scaling_prob (float): Probability of applying scaling augmentation
         """
         super().__init__()
         self.save_hyperparameters(logger=False, ignore=["model"])
@@ -47,11 +50,11 @@ class TraderLitModule(LightningModule):
         self.model_class = model
         self.model = None
 
-        self.use_focal_loss = use_focal_loss
-        self.gamma = gamma
+        # Normalization module will be initialized in setup()
+        self.normalize = None
 
-        # Loss function will be initialized in on_train_start after getting class weights
-        self.loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = None
+        # Store boolean mask for features normalized with close (norm_type=2)
+        self.close_norm_mask = None
 
         # --- Metrics for Training (Binary Classification) ---
         self.train_loss = MeanMetric()
@@ -66,13 +69,55 @@ class TraderLitModule(LightningModule):
 
         self.val_epoch_outputs: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-    def forward(self, x: torch.Tensor, coin_ids: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        coin_ids: torch.Tensor = None,
+        apply_augmentation: bool = False,
+    ) -> torch.Tensor:
+        # Normalize features: (B, P, T, D) -> (B*P, T, D) -> normalize -> (B, P, T, D)
+        B, P, T, D = x.shape
+        x_reshaped = x.reshape(B * P, T, D)
+        x_normalized = self.normalize(x_reshaped, mode="norm")
+
+        # Apply augmentation after normalization if in training mode
+        if apply_augmentation and self.hparams.use_augmentation and self.training:
+            x_normalized = self._apply_augmentation(x_normalized)
+
+        x_normalized = x_normalized.reshape(B, P, T, D)
+
         # Try to pass coin_ids if the model supports it
         try:
-            return self.model(x, coin_ids)
+            return self.model(x_normalized, coin_ids)
         except TypeError:
             # If model doesn't accept coin_ids, fall back to just x
-            return self.model(x)
+            return self.model(x_normalized)
+
+    def _apply_augmentation(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply augmentation only to features that are normalized with close (norm_type=2).
+        x shape: (B*P, T, D)
+        Uses PyTorch operations directly on GPU without CPU conversion.
+
+        Only applies 2 augmentations:
+        - jitter: add Gaussian noise
+        - scaling: multiply by random factors
+        """
+        if self.close_norm_mask is None:
+            return x
+
+        # Apply augmentation with feature mask
+        # feature_mask is boolean tensor indicating which features to augment
+        x_aug = apply_augmentation(
+            x,
+            feature_mask=self.close_norm_mask,
+            jitter_prob=self.hparams.aug_jitter_prob,
+            scaling_prob=self.hparams.aug_scaling_prob,
+            jitter_sigma=0.1,
+            scaling_sigma=0.1,
+        )
+
+        return x_aug
 
     def on_train_start(self) -> None:
         self.val_loss.reset()
@@ -81,65 +126,22 @@ class TraderLitModule(LightningModule):
         self.val_pr_curve.reset()
         self.val_epoch_outputs.clear()
 
-        # Logic loss sẽ được xử lý trong model_step sử dụng per-coin weights
-        # Chỉ khởi tạo loss_fn nếu dùng Focal Loss
-        if self.use_focal_loss:
-            # Focal loss với alpha toàn cục (rút từ class_weights nếu có)
-            global_alpha = 0.5
-            if self.trainer is not None:
-                datamodule = self.trainer.datamodule
-                if (
-                    isinstance(datamodule, CryptoDataModule)
-                    and getattr(datamodule, "class_weights", None) is not None
-                ):
-                    class_weights = datamodule.class_weights.to(self.device)
-                    total_weight = class_weights[0] + class_weights[1]
-                    global_alpha = (class_weights[1] / total_weight).item()
-
-            global_alpha = 0.5
-            focal_loss = BinaryFocalLoss(
-                alpha=global_alpha, gamma=self.gamma, reduction="mean"
-            )
-            self.loss_fn = focal_loss
-            print(
-                f"Using Focal Loss (Global Alpha): alpha={global_alpha:.4f}, gamma={self.gamma:.4f}"
-            )
-        else:
-            # Sẽ sử dụng per-coin weight BCE trong model_step
-            self.loss_fn = None
-            print("Using Per-Coin Weighted BCE (weights from batch)")
-
     def model_step(
-        self, batch: Dict[str, torch.Tensor]
+        self, batch: Dict[str, torch.Tensor], apply_augmentation: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         features = batch["features"]  # (B, P, T, D)
         targets = batch["labels_trade"]  # (B, P), bool type
         coin_ids = batch.get("coin_ids", None)  # (B, P), coin indices
 
-        # Lấy pos_weights từ batch
-        pos_weights = batch.get("pos_weights", None)  # (B, P)
-
-        logits = self.forward(features, coin_ids)  # (B, P, 1)
+        logits = self.forward(
+            features, coin_ids, apply_augmentation=apply_augmentation
+        )  # (B, P, 1)
         logits = logits.squeeze(-1)  # (B, P)
 
         targets_float = targets.float()
 
-        # Tính toán loss
-        if self.use_focal_loss and self.loss_fn is not None:
-            # Focal Loss (alpha toàn cục)
-            loss = self.loss_fn(logits, targets_float)
-        else:
-            # Per-coin weighted BCE
-            if pos_weights is None:
-                loss = nn.functional.binary_cross_entropy_with_logits(
-                    logits, targets_float
-                )
-            else:
-                pos_weights_device = pos_weights.to(logits.device)
-                loss = nn.functional.binary_cross_entropy_with_logits(
-                    logits,
-                    targets_float,  # pos_weight=pos_weights_device
-                )
+        # Simple BCE loss without weighting
+        loss = nn.functional.binary_cross_entropy_with_logits(logits, targets_float)
 
         # Get probabilities and binary predictions for metrics
         probs = torch.sigmoid(logits)  # (B, P)
@@ -150,7 +152,7 @@ class TraderLitModule(LightningModule):
     def training_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
-        loss, preds, probs, targets = self.model_step(batch)
+        loss, preds, probs, targets = self.model_step(batch, apply_augmentation=True)
 
         # Update and log metrics
         self.train_loss(loss)
@@ -189,7 +191,7 @@ class TraderLitModule(LightningModule):
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        loss, preds, probs, targets = self.model_step(batch)
+        loss, preds, probs, targets = self.model_step(batch, apply_augmentation=False)
 
         # Update metrics
         self.val_loss(loss)
@@ -349,6 +351,35 @@ class TraderLitModule(LightningModule):
                 else 128
             )
             self.model = self.model_class(n_features=n_features, max_coins=max_coins)
+
+        # Initialize normalization module
+        if self.normalize is None:
+            # Get feature names and norm types from config
+            feature_names = list(FEATURE_CONFIG.keys())
+            norm_types = [
+                FEATURE_CONFIG[name].get("norm_type", 0) for name in feature_names
+            ]
+            close_idx = feature_names.index("close")
+
+            n_features = len(FEATURE_CONFIG)
+            self.normalize = Normalize(
+                num_features=n_features,
+                norm_types=norm_types,
+                close_idx=close_idx,
+                affine=True,
+            )
+
+            # Create boolean mask for features normalized with close (norm_type=2)
+            # This will be used for selective augmentation
+            self.close_norm_mask = torch.tensor(
+                [norm_type == 2 for norm_type in norm_types],
+                dtype=torch.bool,
+                device=self.device,
+            )
+            n_close_norm = self.close_norm_mask.sum().item()
+            print(
+                f"Features normalized with close (will be augmented): {n_close_norm}/{n_features}"
+            )
 
         if self.hparams.compile and stage == "fit":
             self.model = torch.compile(self.model)

@@ -5,7 +5,7 @@ model:
   _target_: models.itransformer.iTransformer
   _partial_: true
   d_model: 64
-  seq_len: 128
+  seq_len: 64
   n_heads: 4
   e_layers: 4
   d_ff: 256

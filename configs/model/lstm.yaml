@@ -5,6 +5,5 @@ model:
   _target_: models.simple_lstm.SimpleLSTM
   _partial_: true
   hidden_size: 128
-  num_layers: 4
+  num_layers: 2
   dropout: 0.1
-use_focal_loss: true

@@ -1,4 +1,4 @@
-_target_: crypto_datamodule.CryptoDataModule
+_target_: crypto_datamodule_v2.CryptoDataModuleV2
 data_dir: ${paths.data_dir}/crypto-1200
 end_date: 2025-09-29
 validation_start_date: 2025-01-01
