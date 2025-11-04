@@ -9,7 +9,7 @@ lookback_window: 64
 candle_length: 50000
 portfolio_size: 64
 max_coins: 128
-batch_size: 32
+batch_size: 64
 num_workers: 4
 validation_coins: []
 # "BTC",

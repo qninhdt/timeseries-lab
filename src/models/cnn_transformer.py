@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from layers import ResNet1DBackbone
+from layers.resnet_backbone import ResNet1DBackbone
 
 
 class PositionalEncoding(nn.Module):
@@ -21,8 +21,7 @@ class PositionalEncoding(nn.Module):
 
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(
-            torch.arange(0, d_model, 2)
-            * (-torch.log(torch.tensor(10000.0)) / d_model)
+            torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model)
         )
         pe = torch.zeros(1, max_len, d_model)
         pe[0, :, 0::2] = torch.sin(position * div_term)
@@ -42,7 +41,12 @@ class PositionalEncoding(nn.Module):
 
 class CNNTransformer(nn.Module):
     """
-    A CNN-Transformer model with ResNet1D backbone for portfolio data processing.
+    A hybrid CNN-Transformer model for portfolio data processing.
+
+    Architecture:
+    1. ResNet1D backbone for feature extraction (CNN)
+    2. Transformer encoder for temporal modeling
+    3. Classification head
 
     Input shape: (B, P, T, D)
         B: Batch Size
@@ -62,46 +66,58 @@ class CNNTransformer(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
-        # CNN backbone parameters
-        cnn_n_blocks=[2, 2],
-        cnn_planes_per_branch=[32, 64],
-        cnn_target_planes=[32, 64],
-        cnn_num_groups=32,
+        n_blocks: list = [2, 2],
+        planes_per_branch: list = [32, 64],
+        target_planes: list = [32, 64],
+        num_groups: int = 32,
+        use_coin_embedding: bool = False,
+        max_coins: int = 128,
     ):
         """
         Args:
             n_features (int): Number of features (D)
-            d_model (int): Dimension of the model
+            d_model (int): Dimension of the transformer model
             nhead (int): Number of attention heads
             num_layers (int): Number of transformer encoder layers
             dim_feedforward (int): Dimension of the feedforward network
             dropout (float): Dropout rate
-            cnn_n_blocks (list): Number of blocks for each CNN layer
-            cnn_planes_per_branch (list): Number of planes per branch for each CNN layer
-            cnn_target_planes (list): Target output planes for each CNN layer
-            cnn_num_groups (int): Number of groups for GroupNorm
+            n_blocks (list): Number of blocks in each ResNet layer
+            planes_per_branch (list): Number of planes per branch in ResNet
+            target_planes (list): Target planes for each ResNet layer
+            num_groups (int): Number of groups for GroupNorm
+            use_coin_embedding (bool): Whether to use coin-specific embeddings
+            max_coins (int): Maximum number of coins (for coin embedding)
         """
         super().__init__()
         self.n_features = n_features
         self.d_model = d_model
         self.nhead = nhead
         self.num_layers = num_layers
+        self.use_coin_embedding = use_coin_embedding
 
-        # CNN backbone
+        # CNN backbone (ResNet1D)
         self.cnn_backbone = ResNet1DBackbone(
             n_features=n_features,
-            n_blocks=cnn_n_blocks,
-            planes_per_branch=cnn_planes_per_branch,
-            target_planes=cnn_target_planes,
-            num_groups=cnn_num_groups,
+            n_blocks=n_blocks,
+            planes_per_branch=planes_per_branch,
+            target_planes=target_planes,
+            num_groups=num_groups,
         )
 
-        # Project CNN output to d_model dimension
-        cnn_output_dim = self.cnn_backbone.out_channels
-        self.cnn_to_transformer = nn.Linear(cnn_output_dim, d_model)
+        # Get the output channels from CNN backbone
+        cnn_out_channels = self.cnn_backbone.out_channels
 
         # CLS token - learnable embedding
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+
+        # Coin-specific embeddings (optional)
+        if use_coin_embedding:
+            self.coin_embedding = nn.Embedding(max_coins, d_model)
+        else:
+            self.coin_embedding = None
+
+        # Project CNN output to d_model dimension
+        self.cnn_projection = nn.Linear(cnn_out_channels, d_model)
 
         # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model, dropout)
@@ -121,7 +137,17 @@ class CNNTransformer(nn.Module):
         # Linear head to output a single logit per coin
         self.head = nn.Linear(d_model, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, coin_ids: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape (B, P, T, D)
+            coin_ids: Coin indices of shape (B, P) - optional
+
+        Returns:
+            logits: Output tensor of shape (B, P, 1)
+        """
         # x shape: (B, P, T, D)
         B, P, T, D = x.shape
 
@@ -129,14 +155,23 @@ class CNNTransformer(nn.Module):
         # New shape: (B * P, T, D)
         x_flat = x.reshape(B * P, T, D)
 
-        # Pass through CNN backbone
-        # Input: (B * P, T, D) -> Output: (B * P, T', cnn_output_dim)
-        # where T' may be smaller due to striding
-        x_cnn = self.cnn_backbone(x_flat)  # (B * P, T', cnn_output_dim)
+        # Pass through CNN backbone for feature extraction
+        # Input: (B * P, T, D) -> Output: (B * P, T', D')
+        # where T' is the downsampled time dimension
+        cnn_features = self.cnn_backbone(x_flat)
 
-        # Project to d_model dimension
+        # Project CNN features to d_model dimension
         # output shape: (B * P, T', d_model)
-        x_proj = self.cnn_to_transformer(x_cnn)
+        x_proj = self.cnn_projection(cnn_features)
+
+        # Add coin-specific embedding if enabled
+        if self.use_coin_embedding and coin_ids is not None:
+            # coin_ids shape: (B, P) -> (B * P,)
+            coin_ids_flat = coin_ids.reshape(B * P)
+            # Get coin embeddings: (B * P, d_model)
+            coin_emb = self.coin_embedding(coin_ids_flat)
+            # Add to all timesteps: (B * P, d_model) -> (B * P, 1, d_model) -> broadcast
+            x_proj = x_proj + coin_emb.unsqueeze(1)
 
         # Add positional encoding
         # output shape: (B * P, T', d_model)
@@ -164,4 +199,3 @@ class CNNTransformer(nn.Module):
         logits_out = logits.reshape(B, P, 1)
 
         return logits_out
-

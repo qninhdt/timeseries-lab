@@ -7,4 +7,3 @@ __all__ = [
     "InceptionResBlock1D",
     "ResNet1DBackbone",
 ]
-

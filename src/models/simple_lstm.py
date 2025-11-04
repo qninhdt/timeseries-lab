@@ -22,6 +22,7 @@ class SimpleLSTM(nn.Module):
         hidden_size: int,
         num_layers: int,
         dropout: float,
+        max_coins: int = 128,
     ):
         """
         Args:

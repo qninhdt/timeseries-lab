@@ -6,6 +6,11 @@ bottleneck
 torchinfo
 freqtrade
 
+# ML libraries
+scikit-learn
+xgboost
+lightgbm
+
 hydra-core
 hydra-colorlog
 hydra-optuna-sweeper

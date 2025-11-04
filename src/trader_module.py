@@ -43,7 +43,9 @@ class TraderLitModule(LightningModule):
         self.save_hyperparameters(logger=False, ignore=["model"])
 
         n_features = len(FEATURE_CONFIG)
-        self.model = model(n_features=n_features)
+        # Model will be instantiated in setup() after we have access to datamodule
+        self.model_class = model
+        self.model = None
 
         self.use_focal_loss = use_focal_loss
         self.gamma = gamma
@@ -64,8 +66,13 @@ class TraderLitModule(LightningModule):
 
         self.val_epoch_outputs: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+    def forward(self, x: torch.Tensor, coin_ids: torch.Tensor = None) -> torch.Tensor:
+        # Try to pass coin_ids if the model supports it
+        try:
+            return self.model(x, coin_ids)
+        except TypeError:
+            # If model doesn't accept coin_ids, fall back to just x
+            return self.model(x)
 
     def on_train_start(self) -> None:
         self.val_loss.reset()
@@ -89,6 +96,7 @@ class TraderLitModule(LightningModule):
                     total_weight = class_weights[0] + class_weights[1]
                     global_alpha = (class_weights[1] / total_weight).item()
 
+            global_alpha = 0.5
             focal_loss = BinaryFocalLoss(
                 alpha=global_alpha, gamma=self.gamma, reduction="mean"
             )
@@ -106,11 +114,12 @@ class TraderLitModule(LightningModule):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         features = batch["features"]  # (B, P, T, D)
         targets = batch["labels_trade"]  # (B, P), bool type
+        coin_ids = batch.get("coin_ids", None)  # (B, P), coin indices
 
         # Lấy pos_weights từ batch
         pos_weights = batch.get("pos_weights", None)  # (B, P)
 
-        logits = self.forward(features)  # (B, P, 1)
+        logits = self.forward(features, coin_ids)  # (B, P, 1)
         logits = logits.squeeze(-1)  # (B, P)
 
         targets_float = targets.float()
@@ -128,7 +137,8 @@ class TraderLitModule(LightningModule):
             else:
                 pos_weights_device = pos_weights.to(logits.device)
                 loss = nn.functional.binary_cross_entropy_with_logits(
-                    logits, targets_float, pos_weight=pos_weights_device
+                    logits,
+                    targets_float,  # pos_weight=pos_weights_device
                 )
 
         # Get probabilities and binary predictions for metrics
@@ -330,6 +340,16 @@ class TraderLitModule(LightningModule):
         pass
 
     def setup(self, stage: str) -> None:
+        # Instantiate model with correct max_coins from datamodule
+        if self.model is None:
+            n_features = len(FEATURE_CONFIG)
+            max_coins = (
+                len(self.trainer.datamodule.coins)
+                if hasattr(self.trainer.datamodule, "coins")
+                else 128
+            )
+            self.model = self.model_class(n_features=n_features, max_coins=max_coins)
+
         if self.hparams.compile and stage == "fit":
             self.model = torch.compile(self.model)
 

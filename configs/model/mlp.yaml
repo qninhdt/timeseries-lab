@@ -1,0 +1,9 @@
+defaults:
+  - default
+
+model:
+  _target_: models.simple_mlp.SimpleMLP
+  _partial_: true
+  channel_list: [64, 32, 16] # Hidden layer dimensions
+  dropout: 0.2
+# use_focal_loss: true

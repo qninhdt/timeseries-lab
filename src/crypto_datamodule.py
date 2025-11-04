@@ -70,7 +70,7 @@ FEATURE_CONFIG = {
     "sar": {"norm": "close"},
     # "vwap": {"norm": "close"},
     "bb_upper": {"norm": "close"},
-    "bb_middle": {"norm": "close"},
+    # "bb_middle": {"norm": "close"},
     "bb_lower": {"norm": "close"},
     "atr": {"norm": "atr"},
     "macd": {"norm": "macd"},
@@ -88,14 +88,14 @@ FEATURE_CONFIG = {
     "roc": {"norm": None},
     "sma_20": {"norm": "close"},
     "sma_50": {"norm": "close"},
-    # "ema_20": {"norm": "close"},
-    # "ema_50": {"norm": "close"},
-    # "candle_range": {"norm": None},
-    # "candle_body_pct": {"norm": None},
-    # "candle_wick_pct": {"norm": None},
-    # "log_return": {"norm": None},
-    # "temporal_sin": {"norm": None},
-    # "temporal_cos": {"norm": None},
+    "ema_20": {"norm": "close"},
+    "ema_50": {"norm": "close"},
+    "candle_range": {"norm": None},
+    "candle_body_pct": {"norm": None},
+    "candle_wick_pct": {"norm": None},
+    "log_return": {"norm": None},
+    "temporal_sin": {"norm": None},
+    "temporal_cos": {"norm": None},
 }
 
 
@@ -464,7 +464,7 @@ class CryptoDataModule(LightningDataModule):
             "volume": volume,
         }
 
-        # cols["log_return"] = np.log(close_p / (np.roll(close_p, 1) + 1e-8))
+        cols["log_return"] = np.log(close_p / (np.roll(close_p, 1) + 1e-8))
         cols["sar"] = talib.SAR(high_p, low_p)
         cols["bb_upper"], cols["bb_middle"], cols["bb_lower"] = talib.BBANDS(
             close_p, timeperiod=20
@@ -496,20 +496,20 @@ class CryptoDataModule(LightningDataModule):
         # cols["vwap"] = vwap.values if vwap is not None else 0
 
         cols["macd"], cols["macd_signal"], cols["macd_hist"] = talib.MACD(close_p)
-        # cols["ema_20"] = talib.EMA(close_p, timeperiod=20)
-        # cols["ema_50"] = talib.EMA(close_p, timeperiod=50)
+        cols["ema_20"] = talib.EMA(close_p, timeperiod=20)
+        cols["ema_50"] = talib.EMA(close_p, timeperiod=50)
         cols["sma_20"] = talib.SMA(close_p, timeperiod=20)
         cols["sma_50"] = talib.SMA(close_p, timeperiod=50)
         cols["obv"] = talib.OBV(close_p, volume)
         cols["atr"] = talib.ATR(high_p, low_p, close_p, timeperiod=14)
 
-        # cols["candle_range"] = (high_p - low_p) / (open_p + 1e-8)
-        # cols["candle_body_pct"] = np.abs(close_p - open_p) / (high_p - low_p + 1e-8)
-        # cols["candle_wick_pct"] = (high_p - np.maximum(open_p, close_p)) / (
-        #     high_p - low_p + 1e-8
-        # )
-        # cols["temporal_sin"] = np.sin(2 * np.pi * df_raw["date"].dt.hour / 24.0).values
-        # cols["temporal_cos"] = np.cos(2 * np.pi * df_raw["date"].dt.hour / 24.0).values
+        cols["candle_range"] = (high_p - low_p) / (open_p + 1e-8)
+        cols["candle_body_pct"] = np.abs(close_p - open_p) / (high_p - low_p + 1e-8)
+        cols["candle_wick_pct"] = (high_p - np.maximum(open_p, close_p)) / (
+            high_p - low_p + 1e-8
+        )
+        cols["temporal_sin"] = np.sin(2 * np.pi * df_raw["date"].dt.hour / 24.0).values
+        cols["temporal_cos"] = np.cos(2 * np.pi * df_raw["date"].dt.hour / 24.0).values
 
         labels_trade, labels_dir = _calculate_labels_numba(
             close_p,
@@ -980,6 +980,7 @@ class CryptoDataModule(LightningDataModule):
             list_labels_trade = []
             list_labels_dir = []
             list_pos_weights = []
+            list_coin_ids = []
 
             for i, ts_idx in enumerate(batch_timestamp_indices):
                 if is_train:
@@ -1017,6 +1018,7 @@ class CryptoDataModule(LightningDataModule):
                 list_labels_trade.append(labels_trade_slice)
                 list_labels_dir.append(labels_dir_slice)
                 list_pos_weights.append(pos_weights_slice)
+                list_coin_ids.append(coin_indices)
 
             batch_features = np.stack(list_features)
             batch_stats = np.stack(list_stats)
@@ -1025,6 +1027,8 @@ class CryptoDataModule(LightningDataModule):
 
             # (B, P)
             batch_pos_weights = torch.stack(list_pos_weights)
+            # (B, P) - coin indices for each sample
+            batch_coin_ids = torch.from_numpy(np.stack(list_coin_ids)).long()
 
             self._normalize_batch(batch_features, batch_stats)
 
@@ -1033,6 +1037,7 @@ class CryptoDataModule(LightningDataModule):
                 "labels_trade": torch.from_numpy(batch_labels_trade),
                 "labels_dir": torch.from_numpy(batch_labels_dir),
                 "pos_weights": batch_pos_weights,
+                "coin_ids": batch_coin_ids,
             }
 
         return collate_fn

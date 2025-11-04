@@ -8,4 +8,5 @@ model:
   nhead: 4
   num_layers: 4
   dim_feedforward: 256
-  dropout: 0.1
+  dropout: 0.2
+  use_coin_embedding: true

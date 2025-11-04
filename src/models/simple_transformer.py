@@ -24,6 +24,8 @@ class SimpleTransformer(nn.Module):
         num_layers: int,
         dim_feedforward: int,
         dropout: float,
+        use_coin_embedding: bool = False,
+        max_coins: int = 128,
     ):
         """
         Args:
@@ -33,15 +35,24 @@ class SimpleTransformer(nn.Module):
             num_layers (int): Number of transformer encoder layers
             dim_feedforward (int): Dimension of the feedforward network
             dropout (float): Dropout rate
+            use_coin_embedding (bool): Whether to use coin-specific embeddings
+            max_coins (int): Maximum number of coins (for coin embedding)
         """
         super().__init__()
         self.n_features = n_features
         self.d_model = d_model
         self.nhead = nhead
         self.num_layers = num_layers
+        self.use_coin_embedding = use_coin_embedding
 
         # CLS token - learnable embedding
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+
+        # Coin-specific embeddings (optional)
+        if use_coin_embedding:
+            self.coin_embedding = nn.Embedding(max_coins, d_model)
+        else:
+            self.coin_embedding = None
 
         # Input projection to d_model dimension
         self.input_projection = nn.Linear(n_features, d_model)
@@ -64,8 +75,9 @@ class SimpleTransformer(nn.Module):
         # Linear head to output a single logit per coin
         self.head = nn.Linear(d_model, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, coin_ids: torch.Tensor = None) -> torch.Tensor:
         # x shape: (B, P, T, D)
+        # coin_ids shape: (B, P) - indices of coins in the portfolio
         B, P, T, D = x.shape
 
         # "Flatten" B and P into a single batch dimension
@@ -75,6 +87,15 @@ class SimpleTransformer(nn.Module):
         # Project to d_model dimension
         # output shape: (B * P, T, d_model)
         x_proj = self.input_projection(x_flat)
+
+        # Add coin-specific embedding if enabled
+        if self.use_coin_embedding and coin_ids is not None:
+            # coin_ids shape: (B, P) -> (B * P,)
+            coin_ids_flat = coin_ids.reshape(B * P)
+            # Get coin embeddings: (B * P, d_model)
+            coin_emb = self.coin_embedding(coin_ids_flat)
+            # Add to all timesteps: (B * P, d_model) -> (B * P, 1, d_model) -> broadcast
+            x_proj = x_proj + coin_emb.unsqueeze(1)
 
         # Add positional encoding
         # output shape: (B * P, T, d_model)
