@@ -4,7 +4,7 @@ end_date: 2025-09-29
 validation_start_date: 2025-01-01
 barrier_horizon: 4
 barrier_atr_multiplier: 2.0
-lookback_window: 128cryp
+lookback_window: 128
 candle_length: 60000
 portfolio_size: 64
 max_coins: 128
