@@ -147,6 +147,8 @@ class MultiTFTransformer(nn.Module):
             n_blocks=[2, 2],
             planes_per_branch=[32, 64],
             target_planes=[32, 64],
+            context_embed_dim=context_embed_dim,
+            dropout=dropout,
         )
         self.h1_embed = nn.Linear(self.cnn_backbone.out_channels, d_model)
         self.h4_embed = nn.Linear(self.cnn_backbone.out_channels, d_model)
@@ -215,9 +217,15 @@ class MultiTFTransformer(nn.Module):
         h1_base = self.h1_input_proj(h1_flat)
         h4_base = self.h4_input_proj(h4_flat)
         d1_base = self.d1_input_proj(d1_flat)
-        h1_feats = self.cnn_backbone(h1_base)
-        h4_feats = self.cnn_backbone(h4_base)
-        d1_feats = self.cnn_backbone(d1_base)
+
+        # Expand context embeddings for batch
+        h1_context = self.h1_context_embed.expand(batch_size_flat, -1)
+        h4_context = self.h4_context_embed.expand(batch_size_flat, -1)
+        d1_context = self.d1_context_embed.expand(batch_size_flat, -1)
+
+        h1_feats = self.cnn_backbone(h1_base, h1_context)
+        h4_feats = self.cnn_backbone(h4_base, h4_context)
+        d1_feats = self.cnn_backbone(d1_base, d1_context)
         h1_embed = self.h1_embed(h1_feats)
         h4_embed = self.h4_embed(h4_feats)
         d1_embed = self.d1_embed(d1_feats)
