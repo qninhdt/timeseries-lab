@@ -6,9 +6,9 @@ model:
   _partial_: true
   d_model: 64
   nhead: 4
-  num_layers: 4
+  num_layers: 2
   dim_feedforward: 128
   dropout: 0.1
-  n_blocks: [2, 2]
+  n_blocks: [1, 1]
   planes_per_branch: [32, 64]
   target_planes: [32, 64]
