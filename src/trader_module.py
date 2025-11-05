@@ -13,7 +13,6 @@ from torchmetrics.classification import (
     PrecisionRecallCurve,
 )
 
-from crypto_datamodule_v2 import FEATURE_CONFIG
 from layers import Normalize
 from utils.augmentation import apply_augmentation
 
@@ -48,13 +47,14 @@ class TraderLitModule(LightningModule):
         # save_hyperparameters sẽ tự động lấy use_weighted_loss
         self.save_hyperparameters(logger=False, ignore=["model"])
 
-        n_features = len(FEATURE_CONFIG)
         # Model will be instantiated in setup() after we have access to datamodule
         self.model_class = model
         self.model = None
 
         # Normalization module will be initialized in setup()
-        self.normalize = None
+        self.normalize_1h = None
+        self.normalize_4h = None
+        self.normalize_1d = None
 
         # Buffer để lưu trọng số loss, sẽ được khởi tạo trong setup()
         self.register_buffer("coin_pos_weights", None)
@@ -77,27 +77,51 @@ class TraderLitModule(LightningModule):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x_1h: torch.Tensor,
+        x_4h: torch.Tensor,
+        x_1d: torch.Tensor,
         coin_ids: torch.Tensor = None,
         apply_augmentation: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
-        # Normalize features: (B, P, T, D) -> (B*P, T, D) -> normalize -> (B, P, T, D)
-        B, P, T, D = x.shape
-        x_reshaped = x.reshape(B * P, T, D)
-        x_normalized = self.normalize(x_reshaped, mode="norm")
+        """
+        Forward pass with multi-timeframe support.
+
+        Args:
+            x_1h: (B, P, T_1h, D_1h) - 1h timeframe features
+            x_4h: (B, P, T_4h, D_4h) - 4h timeframe features
+            x_1d: (B, P, T_1d, D_1d) - 1d timeframe features
+            coin_ids: (B, P) - coin indices
+            apply_augmentation: bool - whether to apply augmentation
+            **kwargs: Additional parameters (ignored)
+
+        Returns:
+            Logits: (B, P, 1) or (B, P)
+        """
+        B, P, T_1h, D_1h = x_1h.shape
+        _, _, T_4h, D_4h = x_4h.shape
+        _, _, T_1d, D_1d = x_1d.shape
+
+        # Reshape for normalization: (B, P, T, D) -> (B*P, T, D)
+        x_1h_reshaped = x_1h.reshape(B * P, T_1h, D_1h)
+        x_4h_reshaped = x_4h.reshape(B * P, T_4h, D_4h)
+        x_1d_reshaped = x_1d.reshape(B * P, T_1d, D_1d)
+
+        # Normalize all three timeframes together
+        x_1h_norm, x_4h_norm, x_1d_norm = self.normalize(
+            x_1h_reshaped, x_4h_reshaped, x_1d_reshaped, mode="norm"
+        )
 
         # Apply augmentation after normalization if in training mode
         if apply_augmentation and self.hparams.use_augmentation and self.training:
-            x_normalized = self._apply_augmentation(x_normalized)
+            x_1h_norm = self._apply_augmentation(x_1h_norm)
 
-        x_normalized = x_normalized.reshape(B, P, T, D)
+        # Reshape back: (B*P, T, D) -> (B, P, T, D)
+        x_1h_norm = x_1h_norm.reshape(B, P, T_1h, D_1h)
+        x_4h_norm = x_4h_norm.reshape(B, P, T_4h, D_4h)
+        x_1d_norm = x_1d_norm.reshape(B, P, T_1d, D_1d)
 
-        # Try to pass coin_ids if the model supports it
-        try:
-            return self.model(x_normalized, coin_ids)
-        except TypeError:
-            # If model doesn't accept coin_ids, fall back to just x
-            return self.model(x_normalized)
+        return self.model(x_1h_norm, x_4h_norm, x_1d_norm, coin_ids=coin_ids, **kwargs)
 
     def _apply_augmentation(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -109,9 +133,6 @@ class TraderLitModule(LightningModule):
         - jitter: add Gaussian noise
         - scaling: multiply by random factors
         """
-        if self.close_norm_mask is None:
-            return x
-
         # Apply augmentation with feature mask
         # feature_mask is boolean tensor indicating which features to augment
         x_aug = apply_augmentation(
@@ -135,37 +156,36 @@ class TraderLitModule(LightningModule):
     def model_step(
         self, batch: Dict[str, torch.Tensor], apply_augmentation: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = batch["features"]  # (B, P, T, D)
+        features_1h = batch["features_1h"]  # (B, P, T, D)
+        features_4h = batch["features_4h"]  # (B, P, T, D)
+        features_1d = batch["features_1d"]  # (B, P, T, D)
         targets = batch["labels_trade"]  # (B, P), bool type
         coin_ids = batch.get("coin_ids", None)  # (B, P), coin indices
 
         logits = self.forward(
-            features, coin_ids, apply_augmentation=apply_augmentation
+            features_1h,
+            features_4h,
+            features_1d,
+            coin_ids,
+            apply_augmentation=apply_augmentation,
         )  # (B, P, 1)
         logits = logits.squeeze(-1)  # (B, P)
 
         targets_float = targets.float()
 
-        # --- THAY ĐỔI TÍNH TOÁN LOSS ---
+        # Calculate loss
         if self.hparams.use_weighted_loss and self.training and coin_ids is not None:
-            if self.coin_pos_weights is None:
-                # Fallback nếu setup() chưa chạy (không nên xảy ra)
-                loss = nn.functional.binary_cross_entropy_with_logits(
-                    logits, targets_float
-                )
-            else:
-                # self.coin_pos_weights có shape (C_total)
-                # coin_ids có shape (B, P)
-                # Lấy ra các trọng số tương ứng cho batch này
-                batch_pos_weights = self.coin_pos_weights[coin_ids]  # Shape (B, P)
+            # self.coin_pos_weights có shape (C_total)
+            # coin_ids có shape (B, P)
+            # Lấy ra các trọng số tương ứng cho batch này
+            batch_pos_weights = self.coin_pos_weights[coin_ids]  # Shape (B, P)
 
-                loss = nn.functional.binary_cross_entropy_with_logits(
-                    logits, targets_float, pos_weight=batch_pos_weights
-                )
+            loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, targets_float, pos_weight=batch_pos_weights
+            )
         else:
-            # Logic cũ: Loss BCE không trọng số (dùng cho validation hoặc khi tắt weighted_loss)
+            # Loss BCE không trọng số (dùng cho validation hoặc khi tắt weighted_loss)
             loss = nn.functional.binary_cross_entropy_with_logits(logits, targets_float)
-        # --- KẾT THÚC THAY ĐỔI ---
 
         # Get probabilities and binary predictions for metrics
         probs = torch.sigmoid(logits)  # (B, P)
@@ -258,14 +278,11 @@ class TraderLitModule(LightningModule):
             loggers = self.logger if isinstance(self.logger, list) else [self.logger]
             wandb_logger = None
             for logger in loggers:
-                if (
-                    hasattr(logger, "__class__")
-                    and "WandbLogger" in logger.__class__.__name__
-                ):
+                if "WandbLogger" in logger.__class__.__name__:
                     wandb_logger = logger
                     break
 
-            if wandb_logger is not None and hasattr(wandb_logger, "experiment"):
+            if wandb_logger is not None:
 
                 # --- A. Xử lý PR Curve (Logic cũ) ---
                 log_payload = {}
@@ -361,19 +378,23 @@ class TraderLitModule(LightningModule):
 
         # Instantiate model with correct max_coins from datamodule
         if self.model is None:
-            n_features = len(FEATURE_CONFIG)
-            max_coins = len(datamodule.coins) if hasattr(datamodule, "coins") else 128
-            self.model = self.model_class(n_features=n_features, max_coins=max_coins)
+            max_coins = len(datamodule.coins)
 
-        # --- THÊM LOGIC TÍNH TRỌNG SỐ ---
+            # Get feature counts for each timeframe
+            n_features_1h = datamodule.n_features["1h"]
+            n_features_4h = datamodule.n_features["4h"]
+            n_features_1d = datamodule.n_features["1d"]
+
+            self.model = self.model_class(
+                n_features_1h=n_features_1h,
+                n_features_4h=n_features_4h,
+                n_features_1d=n_features_1d,
+                max_coins=max_coins,
+            )
+
+        # Calculate coin-specific positive weights for loss
         if self.hparams.use_weighted_loss and self.coin_pos_weights is None:
             print("Calculating coin-specific positive weights for loss...")
-            if not hasattr(datamodule, "coins") or not hasattr(
-                datamodule, "coin_baselines"
-            ):
-                raise AttributeError(
-                    "DataModule must have 'coins' list and 'coin_baselines' dict to use weighted loss."
-                )
 
             all_coin_names = datamodule.coins
             baselines = datamodule.coin_baselines
@@ -384,7 +405,7 @@ class TraderLitModule(LightningModule):
 
             for i, coin_name in enumerate(all_coin_names):
                 # Lấy tỉ lệ positive (baseline)
-                p = baselines.get(coin_name, 0.5)  # Mặc định 0.5 (trọng số 1) nếu thiếu
+                p = baselines[coin_name]
 
                 # Tính trọng số = (1-p) / p
                 # Thêm epsilon để đảm bảo ổn định số học
@@ -397,36 +418,50 @@ class TraderLitModule(LightningModule):
             print(
                 f"Coin weights calculated and registered. Min: {pos_weights.min():.2f}, Max: {pos_weights.max():.2f}, Mean: {pos_weights.mean():.2f}"
             )
-        # --- KẾT THÚC LOGIC TRỌNG SỐ ---
 
         # Initialize normalization module
-        if self.normalize is None:
-            # Get feature names and norm types from config
-            feature_names = list(FEATURE_CONFIG.keys())
-            norm_types = [
-                FEATURE_CONFIG[name].get("norm_type", 0) for name in feature_names
-            ]
-            close_idx = feature_names.index("close")
+        # Get feature names from datamodule (use 1h features for normalization config)
+        feature_names = datamodule.feature_names["1h"]
 
-            n_features = len(FEATURE_CONFIG)
-            self.normalize = Normalize(
-                num_features=n_features,
-                norm_types=norm_types,
-                close_idx=close_idx,
-                affine=True,
-            )
+        # Determine norm_types based on feature names
+        # Price features (open, high, low, close, volume) use norm_type=2 (close stats)
+        # Other features use norm_type=1 (own stats)
+        price_feature_names = ["open", "high", "low", "close", "volume"]
+        norm_types = []
+        for name in feature_names:
+            if name in price_feature_names:
+                norm_types.append(2)  # Use close stats for price features
+            else:
+                norm_types.append(1)  # Use own stats for other features
 
-            # Create boolean mask for features normalized with close (norm_type=2)
-            # This will be used for selective augmentation
-            self.close_norm_mask = torch.tensor(
-                [norm_type == 2 for norm_type in norm_types],
-                dtype=torch.bool,
-                device=self.device,
-            )
-            n_close_norm = self.close_norm_mask.sum().item()
-            print(
-                f"Features normalized with close (will be augmented): {n_close_norm}/{n_features}"
-            )
+        # Find close index
+        close_idx = feature_names.index("close")
+
+        # Identify price feature indices
+        price_feature_indices = []
+        for name in price_feature_names:
+            if name in feature_names:
+                price_feature_indices.append(feature_names.index(name))
+
+        n_features = len(feature_names)
+        self.normalize = Normalize(
+            num_features=n_features,
+            norm_types=norm_types,
+            close_idx=close_idx,
+            price_feature_indices=price_feature_indices,
+            affine=True,
+        )
+        # Create boolean mask for features normalized with close (norm_type=2)
+        # This will be used for selective augmentation
+        self.close_norm_mask = torch.tensor(
+            [norm_type == 2 for norm_type in norm_types],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        n_close_norm = self.close_norm_mask.sum().item()
+        print(
+            f"Features normalized with close (will be augmented): {n_close_norm}/{n_features}"
+        )
 
         if self.hparams.compile and stage == "fit":
             self.model = torch.compile(self.model)

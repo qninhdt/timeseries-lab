@@ -1,0 +1,18 @@
+defaults:
+  - default
+
+model:
+  _target_: models.multtf_transformer.MultiTFTransformer
+  _partial_: true
+  n_classes: 1
+  base_dim: 32
+  d_model: 64
+  n_head: 4
+  n_context_encoder_layers: 2
+  n_raw_encoder_layers: 2
+  n_cross_layers: 2
+  dim_feedforward: 128
+  max_len: 64
+  dropout: 0.1
+  context_embed_dim: 32
+  raw_window_1h: 16

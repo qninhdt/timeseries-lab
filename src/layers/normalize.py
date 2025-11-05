@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 class Normalize(nn.Module):
@@ -9,22 +9,23 @@ class Normalize(nn.Module):
         num_features: int,
         norm_types: List[int],
         close_idx: int,
+        price_feature_indices: Optional[List[int]] = None,
         eps: float = 1e-5,
         affine: bool = False,
     ):
         """
-        Flexible normalization layer with per-feature normalization strategies.
+        Multi-timeframe normalization layer.
+        Price features across all timeframes use 1h close statistics.
+        Other features use their own statistics per timeframe.
 
-        :param num_features: the number of features or channels
-        :param norm_types: list of normalization types for each feature
-                          0 = no normalization
-                          1 = normalize with own mean/std
-                          2 = normalize with close feature's mean/std
-        :param close_idx: index of the close price feature
-        :param eps: a value added for numerical stability
-        :param affine: if True, has learnable affine parameters
+        :param num_features: number of features for 1h (max features)
+        :param norm_types: normalization type per feature (0=no norm, 1=own stats, 2=close stats)
+        :param close_idx: index of close price feature
+        :param price_feature_indices: indices of price features (open, high, low, close, volume)
+        :param eps: numerical stability epsilon
+        :param affine: enable learnable affine transformation (separate for each timeframe)
         """
-        super(Normalize, self).__init__()
+        super().__init__()
         self.num_features = num_features
         self.norm_types = norm_types
         self.close_idx = close_idx
@@ -35,93 +36,162 @@ class Normalize(nn.Module):
             len(norm_types) == num_features
         ), "norm_types length must match num_features"
 
+        self.price_feature_indices = (
+            price_feature_indices
+            if price_feature_indices is not None
+            else [i for i, nt in enumerate(norm_types) if nt == 2]
+        )
+
+        # Initialize affine parameters for each timeframe (will be sliced based on actual feature count)
         if self.affine:
-            self._init_params()
+            # Initialize with max features (1h), will slice for 4h/1d
+            self.affine_weight_1h = nn.Parameter(torch.ones(num_features))
+            self.affine_bias_1h = nn.Parameter(torch.zeros(num_features))
+            self.affine_weight_4h = nn.Parameter(torch.ones(num_features))
+            self.affine_bias_4h = nn.Parameter(torch.zeros(num_features))
+            self.affine_weight_1d = nn.Parameter(torch.ones(num_features))
+            self.affine_bias_1d = nn.Parameter(torch.zeros(num_features))
 
-        # Store statistics
-        self.mean = None
-        self.stdev = None
+        # Statistics storage (set in _get_statistics)
+        self.mean_1h = None
+        self.stdev_1h = None
+        self.mean_4h = None
+        self.stdev_4h = None
+        self.mean_1d = None
+        self.stdev_1d = None
 
-    def forward(self, x, mode: str):
-        if mode == "norm":
-            self._get_statistics(x)
-            x = self._normalize(x)
-        elif mode == "denorm":
-            x = self._denormalize(x)
-        else:
-            raise NotImplementedError
-        return x
-
-    def _init_params(self):
-        # initialize affine params: (num_features,)
-        self.affine_weight = nn.Parameter(torch.ones(self.num_features))
-        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
-
-    def _get_statistics(self, x):
+    def forward(
+        self,
+        x_1h: torch.Tensor,
+        x_4h: torch.Tensor,
+        x_1d: torch.Tensor,
+        mode: str = "norm",
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Calculate mean and std for each feature based on its norm_type.
-        x shape: (B, T, D) where B=batch, T=time, D=features
+        Normalize three timeframes.
+
+        Args:
+            x_1h: (B, T_1h, D_1h) - 1h timeframe features
+            x_4h: (B, T_4h, D_4h) - 4h timeframe features (common features only)
+            x_1d: (B, T_1d, D_1d) - 1d timeframe features (common features only)
+            mode: "norm" (denorm removed)
+
+        Returns:
+            Tuple of (x_1h_norm, x_4h_norm, x_1d_norm)
         """
-        B, T, D = x.shape
+        if mode != "norm":
+            raise ValueError(f"Only mode='norm' is supported, got {mode}")
 
-        # Initialize storage for means and stds: (B, 1, D)
-        self.mean = torch.zeros(B, 1, D, device=x.device, dtype=x.dtype)
-        self.stdev = torch.ones(B, 1, D, device=x.device, dtype=x.dtype)
+        self._get_statistics(x_1h, x_4h, x_1d)
+        x_1h_norm = self._normalize(x_1h, self.mean_1h, self.stdev_1h, "1h")
+        x_4h_norm = self._normalize(x_4h, self.mean_4h, self.stdev_4h, "4h")
+        x_1d_norm = self._normalize(x_1d, self.mean_1d, self.stdev_1d, "1d")
+        return x_1h_norm, x_4h_norm, x_1d_norm
 
-        for feat_idx in range(D):
+    def _get_statistics(
+        self, x_1h: torch.Tensor, x_4h: torch.Tensor, x_1d: torch.Tensor
+    ) -> None:
+        """Calculate mean and std for each feature per timeframe."""
+        B_1h, T_1h, D_1h = x_1h.shape
+        B_4h, T_4h, D_4h = x_4h.shape
+        B_1d, T_1d, D_1d = x_1d.shape
+        D_common = min(D_4h, D_1d)
+
+        # Initialize statistics
+        self.mean_1h = torch.zeros(B_1h, 1, D_1h, device=x_1h.device, dtype=x_1h.dtype)
+        self.stdev_1h = torch.ones(B_1h, 1, D_1h, device=x_1h.device, dtype=x_1h.dtype)
+        self.mean_4h = torch.zeros(B_4h, 1, D_4h, device=x_4h.device, dtype=x_4h.dtype)
+        self.stdev_4h = torch.ones(B_4h, 1, D_4h, device=x_4h.device, dtype=x_4h.dtype)
+        self.mean_1d = torch.zeros(B_1d, 1, D_1d, device=x_1d.device, dtype=x_1d.dtype)
+        self.stdev_1d = torch.ones(B_1d, 1, D_1d, device=x_1d.device, dtype=x_1d.dtype)
+
+        # Calculate 1h close statistics (used for price features across all timeframes)
+        close_1h = x_1h[:, :, self.close_idx : self.close_idx + 1]  # (B, T, 1)
+        close_1h_mean = torch.mean(close_1h, dim=1, keepdim=True)  # (B, 1, 1)
+        close_1h_std = torch.sqrt(
+            torch.var(close_1h, dim=1, keepdim=True, unbiased=False) + self.eps
+        )  # (B, 1, 1)
+
+        # Process common features (present in all timeframes)
+        for feat_idx in range(D_common):
             norm_type = self.norm_types[feat_idx]
+            is_price = feat_idx in self.price_feature_indices
 
             if norm_type == 0:
-                # No normalization - keep mean=0, std=1
+                continue
+            elif norm_type == 1 and not is_price:
+                # Use own statistics per timeframe
+                self._set_stats(
+                    x_1h[:, :, feat_idx : feat_idx + 1],
+                    self.mean_1h,
+                    self.stdev_1h,
+                    feat_idx,
+                )
+                self._set_stats(
+                    x_4h[:, :, feat_idx : feat_idx + 1],
+                    self.mean_4h,
+                    self.stdev_4h,
+                    feat_idx,
+                )
+                self._set_stats(
+                    x_1d[:, :, feat_idx : feat_idx + 1],
+                    self.mean_1d,
+                    self.stdev_1d,
+                    feat_idx,
+                )
+            elif norm_type == 2 or is_price:
+                # Price features: use 1h close statistics for all timeframes
+                self.mean_1h[:, :, feat_idx : feat_idx + 1] = close_1h_mean
+                self.stdev_1h[:, :, feat_idx : feat_idx + 1] = close_1h_std
+                self.mean_4h[:, :, feat_idx : feat_idx + 1] = close_1h_mean
+                self.stdev_4h[:, :, feat_idx : feat_idx + 1] = close_1h_std
+                self.mean_1d[:, :, feat_idx : feat_idx + 1] = close_1h_mean
+                self.stdev_1d[:, :, feat_idx : feat_idx + 1] = close_1h_std
+
+        # Process 1h-only features
+        for feat_idx in range(D_common, D_1h):
+            norm_type = self.norm_types[feat_idx]
+            if norm_type == 0:
                 continue
             elif norm_type == 1:
-                # Use own statistics
-                feat_data = x[:, :, feat_idx : feat_idx + 1]  # (B, T, 1)
-                self.mean[:, :, feat_idx : feat_idx + 1] = torch.mean(
-                    feat_data, dim=1, keepdim=True
-                )
-                self.stdev[:, :, feat_idx : feat_idx + 1] = torch.sqrt(
-                    torch.var(feat_data, dim=1, keepdim=True, unbiased=False) + self.eps
+                self._set_stats(
+                    x_1h[:, :, feat_idx : feat_idx + 1],
+                    self.mean_1h,
+                    self.stdev_1h,
+                    feat_idx,
                 )
             elif norm_type == 2:
-                # Use close feature's statistics
-                close_data = x[:, :, self.close_idx : self.close_idx + 1]  # (B, T, 1)
-                self.mean[:, :, feat_idx : feat_idx + 1] = torch.mean(
-                    close_data, dim=1, keepdim=True
-                )
-                self.stdev[:, :, feat_idx : feat_idx + 1] = torch.sqrt(
-                    torch.var(close_data, dim=1, keepdim=True, unbiased=False)
-                    + self.eps
-                )
+                self.mean_1h[:, :, feat_idx : feat_idx + 1] = close_1h_mean
+                self.stdev_1h[:, :, feat_idx : feat_idx + 1] = close_1h_std
 
-    def _normalize(self, x):
-        """
-        Normalize features based on their norm_types.
-        x shape: (B, T, D)
-        """
-        # Apply normalization per feature
-        x_normalized = (x - self.mean) / self.stdev
+    def _set_stats(
+        self, feat: torch.Tensor, mean: torch.Tensor, stdev: torch.Tensor, feat_idx: int
+    ) -> None:
+        """Set mean and std for a single feature."""
+        mean[:, :, feat_idx : feat_idx + 1] = torch.mean(feat, dim=1, keepdim=True)
+        stdev[:, :, feat_idx : feat_idx + 1] = torch.sqrt(
+            torch.var(feat, dim=1, keepdim=True, unbiased=False) + self.eps
+        )
 
-        # Apply affine transformation if enabled
+    def _normalize(
+        self, x: torch.Tensor, mean: torch.Tensor, stdev: torch.Tensor, timeframe: str
+    ) -> torch.Tensor:
+        """Normalize features for a specific timeframe."""
+        x_norm = (x - mean) / stdev
+
         if self.affine:
-            # affine_weight and affine_bias are (D,), need to broadcast
-            x_normalized = x_normalized * self.affine_weight
-            x_normalized = x_normalized + self.affine_bias
+            D = x.shape[-1]
+            if timeframe == "1h":
+                weight = self.affine_weight_1h[:D]
+                bias = self.affine_bias_1h[:D]
+            elif timeframe == "4h":
+                weight = self.affine_weight_4h[:D]
+                bias = self.affine_bias_4h[:D]
+            elif timeframe == "1d":
+                weight = self.affine_weight_1d[:D]
+                bias = self.affine_bias_1d[:D]
+            else:
+                raise ValueError(f"Unknown timeframe: {timeframe}")
+            x_norm = x_norm * weight + bias
 
-        # Clip to avoid extreme values
-        x_normalized = torch.clamp(x_normalized, -5.0, 5.0)
-
-        return x_normalized
-
-    def _denormalize(self, x):
-        """
-        Denormalize features back to original scale.
-        """
-        if self.affine:
-            x = x - self.affine_bias
-            x = x / (self.affine_weight + self.eps * self.eps)
-
-        x = x * self.stdev
-        x = x + self.mean
-
-        return x
+        return torch.clamp(x_norm, -5.0, 5.0)
