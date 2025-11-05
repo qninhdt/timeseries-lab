@@ -135,19 +135,19 @@ class MultiTFTransformer(nn.Module):
         self.base_dim = base_dim
         self.raw_window_1h = raw_window_1h
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-        self.context_embed_dim = context_embed_dim
-        self.h1_context_embed = nn.Parameter(torch.randn(1, context_embed_dim))
-        self.h4_context_embed = nn.Parameter(torch.randn(1, context_embed_dim))
-        self.d1_context_embed = nn.Parameter(torch.randn(1, context_embed_dim))
+        # self.context_embed_dim = context_embed_dim
+        # self.h1_context_embed = nn.Parameter(torch.randn(1, context_embed_dim))
+        # self.h4_context_embed = nn.Parameter(torch.randn(1, context_embed_dim))
+        # self.d1_context_embed = nn.Parameter(torch.randn(1, context_embed_dim))
         self.h1_input_proj = nn.Linear(n_features_1h, base_dim)
         self.h4_input_proj = nn.Linear(n_features_4h, base_dim)
         self.d1_input_proj = nn.Linear(n_features_1d, base_dim)
         self.cnn_backbone = ResNet1DBackbone(
             n_features=base_dim,
-            n_blocks=[2, 2],
+            n_blocks=[1, 1],
             planes_per_branch=[32, 64],
             target_planes=[32, 64],
-            context_embed_dim=context_embed_dim,
+            # context_embed_dim=context_embed_dim,
             dropout=dropout,
         )
         self.h1_embed = nn.Linear(self.cnn_backbone.out_channels, d_model)
@@ -167,14 +167,36 @@ class MultiTFTransformer(nn.Module):
                 batch_first=True,
             )
 
-        self.context_encoder = nn.TransformerEncoder(
+        # Separate encoders for each timeframe
+        self.h1_encoder = nn.TransformerEncoder(
+            _create_encoder_layer(), num_layers=n_context_encoder_layers
+        )
+        self.h4_encoder = nn.TransformerEncoder(
+            _create_encoder_layer(), num_layers=n_context_encoder_layers
+        )
+        self.d1_encoder = nn.TransformerEncoder(
             _create_encoder_layer(), num_layers=n_context_encoder_layers
         )
         self.h1_raw_proj = nn.Linear(n_features_1h, d_model)
         self.raw_encoder = nn.TransformerEncoder(
             _create_encoder_layer(), num_layers=n_raw_encoder_layers
         )
-        self.stacked_cross_attn = StackedCrossAttention(
+        # Separate cross attention for each cross-attention step
+        self.cross_attn_h1 = StackedCrossAttention(
+            n_cross_layers=n_cross_layers,
+            d_model=d_model,
+            n_head=n_head,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+        )
+        self.cross_attn_h4 = StackedCrossAttention(
+            n_cross_layers=n_cross_layers,
+            d_model=d_model,
+            n_head=n_head,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+        )
+        self.cross_attn_d1 = StackedCrossAttention(
             n_cross_layers=n_cross_layers,
             d_model=d_model,
             n_head=n_head,
@@ -219,13 +241,13 @@ class MultiTFTransformer(nn.Module):
         d1_base = self.d1_input_proj(d1_flat)
 
         # Expand context embeddings for batch
-        h1_context = self.h1_context_embed.expand(batch_size_flat, -1)
-        h4_context = self.h4_context_embed.expand(batch_size_flat, -1)
-        d1_context = self.d1_context_embed.expand(batch_size_flat, -1)
+        # h1_context = self.h1_context_embed.expand(batch_size_flat, -1)
+        # h4_context = self.h4_context_embed.expand(batch_size_flat, -1)
+        # d1_context = self.d1_context_embed.expand(batch_size_flat, -1)
 
-        h1_feats = self.cnn_backbone(h1_base, h1_context)
-        h4_feats = self.cnn_backbone(h4_base, h4_context)
-        d1_feats = self.cnn_backbone(d1_base, d1_context)
+        h1_feats = self.cnn_backbone(h1_base)
+        h4_feats = self.cnn_backbone(h4_base)
+        d1_feats = self.cnn_backbone(d1_base)
         h1_embed = self.h1_embed(h1_feats)
         h4_embed = self.h4_embed(h4_feats)
         d1_embed = self.d1_embed(d1_feats)
@@ -234,15 +256,19 @@ class MultiTFTransformer(nn.Module):
         d1_embed_pos = self._add_positional_encoding(d1_embed)
         h1_raw_embed = self.h1_raw_proj(h1_raw)
         h1_raw_embed_pos = self._add_positional_encoding(h1_raw_embed)
-        h1_reps = self.context_encoder(h1_embed_pos).contiguous()
-        h4_reps = self.context_encoder(h4_embed_pos).contiguous()
-        d1_reps = self.context_encoder(d1_embed_pos).contiguous()
+
+        # Encode each timeframe with separate encoders
+        h1_reps = self.h1_encoder(h1_embed_pos).contiguous()
+        h4_reps = self.h4_encoder(h4_embed_pos).contiguous()
+        d1_reps = self.d1_encoder(d1_embed_pos).contiguous()
         h1_raw_reps = self.raw_encoder(
             torch.cat([cls_tokens, h1_raw_embed_pos], dim=1)
         ).contiguous()
-        context_h1 = self.stacked_cross_attn(query=h1_raw_reps, memory=h1_reps)
-        context_h4 = self.stacked_cross_attn(query=context_h1, memory=h4_reps)
-        context_d1 = self.stacked_cross_attn(query=context_h4, memory=d1_reps)
+
+        # Cross attention with separate cross encoders
+        context_h1 = self.cross_attn_h1(query=h1_raw_reps, memory=h1_reps)
+        context_h4 = self.cross_attn_h4(query=context_h1, memory=h4_reps)
+        context_d1 = self.cross_attn_d1(query=context_h4, memory=d1_reps)
         h1_raw_cls = h1_raw_reps[:, 0, :]
         context_d1_cls = context_d1[:, 0, :]
         fused_reps = torch.cat([context_d1_cls, h1_raw_cls], dim=1)
