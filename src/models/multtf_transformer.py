@@ -120,21 +120,20 @@ class MultiTFTransformer(nn.Module):
         d_model: int = 256,
         n_head: int = 8,
         n_context_encoder_layers: int = 3,
-        n_raw_encoder_layers: int = 2,
         n_cross_layers: int = 2,
         dim_feedforward: int = 1024,
         max_len: int = 500,
         dropout: float = 0.1,
         context_embed_dim: int = 64,
-        raw_window_1h: int = 16,
         max_coins: int = 128,
         **kwargs,
     ):
         super().__init__()
         self.d_model = d_model
         self.base_dim = base_dim
-        self.raw_window_1h = raw_window_1h
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+        self.max_coins = max_coins
+        # Each coin has its own cls token: (max_coins, 1, d_model)
+        self.cls_token = nn.Parameter(torch.randn(max_coins, 1, d_model))
         # self.context_embed_dim = context_embed_dim
         # self.h1_context_embed = nn.Parameter(torch.randn(1, context_embed_dim))
         # self.h4_context_embed = nn.Parameter(torch.randn(1, context_embed_dim))
@@ -177,18 +176,8 @@ class MultiTFTransformer(nn.Module):
         self.d1_encoder = nn.TransformerEncoder(
             _create_encoder_layer(), num_layers=n_context_encoder_layers
         )
-        self.h1_raw_proj = nn.Linear(n_features_1h, d_model)
-        self.raw_encoder = nn.TransformerEncoder(
-            _create_encoder_layer(), num_layers=n_raw_encoder_layers
-        )
         # Separate cross attention for each cross-attention step
-        self.cross_attn_h1 = StackedCrossAttention(
-            n_cross_layers=n_cross_layers,
-            d_model=d_model,
-            n_head=n_head,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-        )
+        # Note: cross_attn_h1 removed, using h1_reps directly
         self.cross_attn_h4 = StackedCrossAttention(
             n_cross_layers=n_cross_layers,
             d_model=d_model,
@@ -234,8 +223,16 @@ class MultiTFTransformer(nn.Module):
         h4_flat = h4.reshape(B * P, T_4h, D_4h)
         d1_flat = d1.reshape(B * P, T_1d, D_1d)
         batch_size_flat = B * P
-        cls_tokens = self.cls_token.expand(batch_size_flat, -1, -1)
-        h1_raw = h1_flat[:, -self.raw_window_1h :, :]
+
+        # Get coin-specific cls tokens using coin_ids
+        if coin_ids is None:
+            raise ValueError(
+                "coin_ids must be provided for MultiTFTransformer with coin-specific cls tokens"
+            )
+        # Flatten coin_ids: (B, P) -> (B*P,)
+        coin_ids_flat = coin_ids.reshape(-1)  # (B*P,)
+        # Index into cls_token: (B*P,) -> (B*P, 1, d_model)
+        cls_tokens = self.cls_token[coin_ids_flat]  # (B*P, 1, d_model)
         h1_base = self.h1_input_proj(h1_flat)
         h4_base = self.h4_input_proj(h4_flat)
         d1_base = self.d1_input_proj(d1_flat)
@@ -254,24 +251,26 @@ class MultiTFTransformer(nn.Module):
         h1_embed_pos = self._add_positional_encoding(h1_embed)
         h4_embed_pos = self._add_positional_encoding(h4_embed)
         d1_embed_pos = self._add_positional_encoding(d1_embed)
-        h1_raw_embed = self.h1_raw_proj(h1_raw)
-        h1_raw_embed_pos = self._add_positional_encoding(h1_raw_embed)
+
+        # Add cls token to h1 before encoding
+        h1_with_cls = torch.cat(
+            [cls_tokens, h1_embed_pos], dim=1
+        )  # (B*P, 1+T_1h, d_model)
 
         # Encode each timeframe with separate encoders
-        h1_reps = self.h1_encoder(h1_embed_pos).contiguous()
+        h1_reps = self.h1_encoder(h1_with_cls).contiguous()  # (B*P, 1+T_1h, d_model)
         h4_reps = self.h4_encoder(h4_embed_pos).contiguous()
         d1_reps = self.d1_encoder(d1_embed_pos).contiguous()
-        h1_raw_reps = self.raw_encoder(
-            torch.cat([cls_tokens, h1_raw_embed_pos], dim=1)
-        ).contiguous()
 
-        # Cross attention with separate cross encoders
-        context_h1 = self.cross_attn_h1(query=h1_raw_reps, memory=h1_reps)
-        context_h4 = self.cross_attn_h4(query=context_h1, memory=h4_reps)
+        # Cross attention: start from h1_reps (with cls_token) directly
+        # Bỏ cross_attn_h1, sử dụng h1_reps trực tiếp
+        context_h4 = self.cross_attn_h4(query=h1_reps, memory=h4_reps)
         context_d1 = self.cross_attn_d1(query=context_h4, memory=d1_reps)
-        h1_raw_cls = h1_raw_reps[:, 0, :]
-        context_d1_cls = context_d1[:, 0, :]
-        fused_reps = torch.cat([context_d1_cls, h1_raw_cls], dim=1)
+
+        # Extract cls token from h1_reps (first position)
+        h1_cls = h1_reps[:, 0, :]  # (B*P, d_model)
+        context_d1_cls = context_d1[:, 0, :]  # (B*P, d_model)
+        fused_reps = torch.cat([context_d1_cls, h1_cls], dim=1)
         logits = self.classifier(fused_reps)
         n_classes = self.classifier[-1].out_features
         if n_classes == 1:

@@ -69,10 +69,6 @@ def _calculate_labels_numba(
     return labels_trade, labels_dir
 
 
-# <<< MỚI: FEATURE_CONFIG không còn được dùng làm biến toàn cục
-# vì các đặc trưng giờ đây phụ thuộc vào khung thời gian.
-
-
 # ========================================================================
 # 2. DATASET (Minimalist)
 # ========================================================================
@@ -109,7 +105,6 @@ class CryptoDataModule(LightningDataModule):
         end_date: str = "2025-09-29",
         validation_start_date: str = "2025-06-01",
         candle_length: int = 40000,
-        # <<< MỚI: Thêm 3 tham số lookback window
         lookback_window_1h: int = 64,
         lookback_window_4h: int = 16,
         lookback_window_1d: int = 7,
@@ -122,7 +117,6 @@ class CryptoDataModule(LightningDataModule):
         validation_coins: Optional[List[str]] = None,
     ):
         super().__init__()
-        # <<< MỚI: Đổi tên lookback_window -> lookback_window_1h
         self.save_hyperparameters(
             "data_dir",
             "end_date",
@@ -148,9 +142,11 @@ class CryptoDataModule(LightningDataModule):
         )
 
         # --- Feature Config ---
-        # <<< MỚI: Sẽ được điền động
         self.feature_names: Dict[str, List[str]] = {}
         self.n_features: Dict[str, int] = {}
+        # <<< MỚI: Thêm norm_types và close_idx_1h
+        self.norm_types: Dict[str, List[int]] = {}
+        self.close_idx_1h: int = -1
 
         # --- Internal State ---
         self.coins: List[str] = []
@@ -164,11 +160,8 @@ class CryptoDataModule(LightningDataModule):
         # --- Optimized Data Storage ---
         self.all_labels_trade_aligned: np.ndarray = None
         self.all_labels_dir_aligned: np.ndarray = None
-        self.mask_aligned: np.ndarray = (
-            None  # Đây sẽ là mask *cuối cùng* sau khi tính toán
-        )
+        self.mask_aligned: np.ndarray = None
 
-        # <<< MỚI: Lưu trữ 3 bộ đặc trưng và 3 bản đồ căn chỉnh
         self.features_per_coin: Dict[str, List[np.ndarray]] = {
             "1h": [],
             "4h": [],
@@ -176,7 +169,6 @@ class CryptoDataModule(LightningDataModule):
         }
         self.master_to_local_map_aligned: Dict[str, np.ndarray] = {}
 
-        # <<< MỚI: Cần một mask 1h tạm thời trước khi tính toán lookback
         self._mask_1h_raw: np.ndarray = None
 
     def prepare_data(self):
@@ -228,10 +220,8 @@ class CryptoDataModule(LightningDataModule):
         self.all_labels_dir_aligned = np.full(
             (n_coins, n_timestamps), False, dtype=np.bool_
         )
-        # <<< MỚI: _mask_1h_raw lưu trữ tính hợp lệ *chỉ* của 1h
         self._mask_1h_raw = np.full((n_coins, n_timestamps), False, dtype=np.bool_)
 
-        # <<< MỚI: Khởi tạo bộ lưu trữ cho 3 khung thời gian
         self.features_per_coin = {
             "1h": [None] * n_coins,
             "4h": [None] * n_coins,
@@ -244,7 +234,6 @@ class CryptoDataModule(LightningDataModule):
         }
         print("Initialized empty data arrays for 1h, 4h, 1d.")
 
-        # <<< MỚI: DataFrame chính để căn chỉnh
         self.master_df = pd.DataFrame(
             {"date": self.master_timestamps, "master_idx": np.arange(n_timestamps)}
         )
@@ -265,25 +254,25 @@ class CryptoDataModule(LightningDataModule):
             task = progress.add_task(f"Processing {n_coins} coins", total=n_coins)
 
             for i, coin_info in enumerate(jobs):
-                # <<< MỚI: Cập nhật self.n_features trong lần chạy đầu tiên
                 is_first_coin = i == 0
                 self._process_and_fill_coin(coin_info, is_first_coin=is_first_coin)
                 progress.update(task, advance=1)
 
         print("Sequential processing complete.")
-        del self.master_df  # Không cần nữa, giải phóng bộ nhớ
+        del self.master_df
         gc.collect()
 
         # --- 4. Post-processing (Splitting, Masking) ---
-        self._calculate_validity_mask()  # <<< MỚI: Logic này đã thay đổi hoàn toàn
+        self._calculate_validity_mask()
         self._find_samples_and_split()
         self._find_validation_coins()
         self._calculate_coin_baselines()
 
         print(f"--- Setup complete ---")
-        print(f"  Features 1h: {self.n_features['1h']} | {self.feature_names['1h']}")
-        print(f"  Features 4h: {self.n_features['4h']} | {self.feature_names['4h']}")
-        print(f"  Features 1d: {self.n_features['1d']} | {self.feature_names['1d']}")
+        print(f"  Features 1h: {self.n_features['1h']}")
+        print(f"  Features 4h: {self.n_features['4h']}")
+        print(f"  Features 1d: {self.n_features['1d']}")
+        print(f"  Close_1h index: {self.close_idx_1h}")
         print(f"  Total valid train samples: {len(self.train_indices):,}")
         print(f"  Total valid val samples: {len(self.val_indices):,}")
 
@@ -305,17 +294,16 @@ class CryptoDataModule(LightningDataModule):
         if df.empty:
             return None
 
-        # <<< MỚI: Đảm bảo 'date' là duy nhất và được sắp xếp
         df = df.drop_duplicates(subset=["date"]).sort_values("date")
 
         return df[["date", "open", "high", "low", "close", "volume"]].copy()
 
-    # <<< MỚI: Hàm trợ giúp để tính toán các đặc trưng
+    # <<< MỚI: Cấu hình norm được chuyển vào đây
     def _calculate_features(
         self, df_in: pd.DataFrame, timeframe: str
-    ) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
+    ) -> Tuple[pd.DataFrame, np.ndarray, List[str], List[int]]:
         """
-        Tính toán các chỉ báo kỹ thuật cho một DataFrame.
+        Tính toán các chỉ báo kỹ thuật VÀ loại chuẩn hóa (norm_type) cho chúng.
         Labels (nhãn) CHỈ được tính cho khung 1h.
         """
         df = df_in.copy()
@@ -333,11 +321,59 @@ class CryptoDataModule(LightningDataModule):
             "volume": volume,
         }
 
-        # BBands cho tất cả timeframes (h4, d1 cần)
+        # --- Định nghĩa loại chuẩn hóa (Normalization) ---
+        # Type 0: Không chuẩn hóa (đã chuẩn hóa hoặc không cần)
+        # Type 1: Dùng mean/std của chính nó
+        # Type 2: Dùng mean/std của close_h1 (áp dụng cho tất cả các feature giá/volume)
+
+        # Đây là các feature dùng mean/std của close_h1 (type 2)
+        price_feature_names = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "sma_50",
+            "sma_200",
+            "bb_upper",
+            "bb_middle",
+            "bb_lower",
+            "atr",
+            "sar",
+            "macd",  # macd là chênh lệch giá, nên norm theo giá
+            "macd_signal",  # Tương tự
+        ]
+
+        # Các feature này là (type 1), sẽ dùng mean/std của riêng nó
+        own_stat_features = [
+            "volume",  # Volume có range quá lớn, nên dùng std của riêng nó
+            "obv",  # Tương tự volume
+        ]
+
+        # Các feature này là (type 0), không cần chuẩn hóa
+        no_norm_features = [
+            "temporal_sin",
+            "temporal_cos",
+            "log_return",
+            "rsi",
+            "cci",
+            "mfi",
+            "roc",
+            "cmf",
+            "candle_range",
+            "candle_body_pct",
+            "candle_wick_pct",
+        ]
+
+        # --- Tính toán Features ---
+
+        # BBands cho tất cả timeframes
         bb_upper, bb_middle, bb_lower = talib.BBANDS(close_p, timeperiod=20)
         cols["bb_upper"] = bb_upper.astype(np.float32)
         cols["bb_middle"] = bb_middle.astype(np.float32)
         cols["bb_lower"] = bb_lower.astype(np.float32)
+
+        cols["sma_50"] = talib.SMA(close_p, timeperiod=50).astype(np.float32)
+        cols["sma_200"] = talib.SMA(close_p, timeperiod=200).astype(np.float32)
 
         # --- Chỉ tính các chỉ báo cho 1h (không tính cho h4, d1) ---
         if timeframe == "1h":
@@ -346,17 +382,9 @@ class CryptoDataModule(LightningDataModule):
             )
             cols["sar"] = talib.SAR(high_p, low_p).astype(np.float32)
 
-            # Tạm thời comment các chỉ báo sau
-            # cols["adx"] = (talib.ADX(high_p, low_p, close_p, timeperiod=14) / 50.0).astype(
-            #     np.float32
-            # ) - 1.0
             cols["rsi"] = (talib.RSI(close_p, timeperiod=14) / 50.0).astype(
                 np.float32
             ) - 1.0
-            # Tạm thời comment stoch
-            # stoch_k, stoch_d = talib.STOCH(high_p, low_p, close_p)
-            # cols["stoch_k"] = (stoch_k / 50.0).astype(np.float32) - 1.0
-            # cols["stoch_d"] = (stoch_d / 50.0).astype(np.float32) - 1.0
             cci_raw = talib.CCI(high_p, low_p, close_p, timeperiod=14)
             cols["cci"] = (np.clip(cci_raw, -200, 200) / 200.0).astype(np.float32)
             cols["mfi"] = (
@@ -372,11 +400,6 @@ class CryptoDataModule(LightningDataModule):
             cols["macd"] = macd.astype(np.float32)
             cols["macd_signal"] = macd_signal.astype(np.float32)
 
-            # Tạm thời comment ema20, ema50
-            # cols["ema_20"] = talib.EMA(close_p, timeperiod=20).astype(np.float32)
-            # cols["ema_50"] = talib.EMA(close_p, timeperiod=50).astype(np.float32)
-            cols["sma_20"] = talib.SMA(close_p, timeperiod=20).astype(np.float32)
-            cols["sma_50"] = talib.SMA(close_p, timeperiod=50).astype(np.float32)
             cols["obv"] = talib.OBV(close_p, volume).astype(np.float32)
             cols["atr"] = talib.ATR(high_p, low_p, close_p, timeperiod=14).astype(
                 np.float32
@@ -392,7 +415,6 @@ class CryptoDataModule(LightningDataModule):
                 (high_p - np.maximum(open_p, close_p)) / (high_p - low_p + 1e-8)
             ).astype(np.float32)
 
-            # --- Đặc trưng riêng của 1h ---
             cols["temporal_sin"] = np.sin(
                 2 * np.pi * df["date"].dt.hour / 24.0
             ).values.astype(np.float32)
@@ -410,9 +432,28 @@ class CryptoDataModule(LightningDataModule):
             cols["label_trade"] = labels_trade
             cols["label_dir"] = labels_dir
 
+        # --- Tạo feature_names và norm_types ---
         feature_names = [
             k for k in cols.keys() if k not in ["date", "label_trade", "label_dir"]
         ]
+
+        # <<< MỚI: Tạo danh sách norm_types
+        norm_types = []
+        for name in feature_names:
+            if name in no_norm_features:
+                norm_types.append(0)
+            elif name in price_feature_names:
+                norm_types.append(2)
+            elif name in own_stat_features:
+                norm_types.append(1)
+            else:
+                # Mặc định, nếu không được định nghĩa, dùng type 1 (norm riêng)
+                # Điều này an toàn hơn là không norm, nhưng cũng có thể gây warning
+                warnings.warn(
+                    f"Feature '{name}' in timeframe '{timeframe}' not assigned a norm type, defaulting to 1 (own stats)."
+                )
+                norm_types.append(1)
+
         df_out = pd.DataFrame(cols, index=df["date"])
         df_out.replace([np.inf, -np.inf], np.nan, inplace=True)
 
@@ -421,11 +462,10 @@ class CryptoDataModule(LightningDataModule):
         features_array = feature_df.values.astype(np.float32)
 
         if timeframe == "1h":
-            return df_out, features_array, feature_names
+            return df_out, features_array, feature_names, norm_types
         else:
-            return df_out, features_array, feature_names
+            return df_out, features_array, feature_names, norm_types
 
-    # <<< MỚI: Hàm này được viết lại hoàn toàn
     def _process_coin_numpy_optimized(self, df_raw: pd.DataFrame) -> Dict[str, Tuple]:
         """
         Tính toán đặc trưng và nhãn cho 3 khung thời gian 1h, 4h, 1d.
@@ -433,13 +473,20 @@ class CryptoDataModule(LightningDataModule):
         results = {}
 
         # 1. Xử lý 1H (Khung thời gian cơ sở)
-        df_1h, features_1h, feature_names_1h = self._calculate_features(df_raw, "1h")
+        # <<< MỚI: Nhận 4 giá trị trả về
+        (
+            df_1h,
+            features_1h,
+            feature_names_1h,
+            norm_types_1h,
+        ) = self._calculate_features(df_raw, "1h")
         results["1h"] = (
             df_1h.index.values,  # dates
             features_1h,
             df_1h["label_trade"].values.astype(np.bool_),
             df_1h["label_dir"].values.astype(np.bool_),
             feature_names_1h,
+            norm_types_1h,  # <<< MỚI
         )
 
         # 2. Resample và xử lý 4H
@@ -459,10 +506,18 @@ class CryptoDataModule(LightningDataModule):
             .reset_index()
         )
         if not df_4h_raw.empty:
-            df_4h, features_4h, feature_names_4h = self._calculate_features(
-                df_4h_raw, "4h"
+            (
+                df_4h,
+                features_4h,
+                feature_names_4h,
+                norm_types_4h,  # <<< MỚI
+            ) = self._calculate_features(df_4h_raw, "4h")
+            results["4h"] = (
+                df_4h.index.values,
+                features_4h,
+                feature_names_4h,
+                norm_types_4h,  # <<< MỚI
             )
-            results["4h"] = (df_4h.index.values, features_4h, feature_names_4h)  # dates
 
         # 3. Resample và xử lý 1D
         df_1d_raw = (
@@ -472,14 +527,21 @@ class CryptoDataModule(LightningDataModule):
             .reset_index()
         )
         if not df_1d_raw.empty:
-            df_1d, features_1d, feature_names_1d = self._calculate_features(
-                df_1d_raw, "1d"
+            (
+                df_1d,
+                features_1d,
+                feature_names_1d,
+                norm_types_1d,  # <<< MỚI
+            ) = self._calculate_features(df_1d_raw, "1d")
+            results["1d"] = (
+                df_1d.index.values,
+                features_1d,
+                feature_names_1d,
+                norm_types_1d,  # <<< MỚI
             )
-            results["1d"] = (df_1d.index.values, features_1d, feature_names_1d)  # dates
 
         return results
 
-    # <<< MỚI: Hàm này được viết lại hoàn toàn để căn chỉnh 3 khung thời gian
     def _process_and_fill_coin(
         self, coin_info: Tuple[int, str], is_first_coin: bool = False
     ):
@@ -493,12 +555,11 @@ class CryptoDataModule(LightningDataModule):
         if df_raw is None:
             return
 
-        # results chứa {'1h': (...), '4h': (...), '1d': (...)}
         results = self._process_coin_numpy_optimized(df_raw)
 
         # --- Xử lý 1H (Giống như cũ) ---
         if "1h" not in results:
-            return  # Bỏ qua nếu không có dữ liệu 1h
+            return
 
         (
             dates_1h,
@@ -506,11 +567,18 @@ class CryptoDataModule(LightningDataModule):
             labels_trade_array,
             labels_dir_array,
             feature_names_1h,
+            norm_types_1h,  # <<< MỚI
         ) = results["1h"]
 
+        # <<< MỚI: Lưu trữ cấu hình norm nếu là coin đầu tiên
         if is_first_coin:
             self.feature_names["1h"] = feature_names_1h
             self.n_features["1h"] = len(feature_names_1h)
+            self.norm_types["1h"] = norm_types_1h
+            try:
+                self.close_idx_1h = feature_names_1h.index("close")
+            except ValueError:
+                raise ValueError("Feature 'close' not found in 1h feature list.")
 
         master_indices_1h = []
         df_indices_1h = []
@@ -520,12 +588,11 @@ class CryptoDataModule(LightningDataModule):
                 df_indices_1h.append(i)
 
         if not master_indices_1h:
-            return  # Bỏ qua nếu không có mốc thời gian 1h nào khớp
+            return
 
         valid_features_1h = features_array_1h[df_indices_1h].astype(np.float32)
         local_indices_for_map_1h = np.arange(len(df_indices_1h), dtype=np.int32)
 
-        # Ghi trực tiếp
         self.all_labels_trade_aligned[coin_idx, master_indices_1h] = labels_trade_array[
             df_indices_1h
         ]
@@ -540,12 +607,17 @@ class CryptoDataModule(LightningDataModule):
 
         # --- Xử lý 4H (Logic căn chỉnh mới) ---
         if "4h" in results:
-            dates_4h, features_array_4h, feature_names_4h = results["4h"]
+            (
+                dates_4h,
+                features_array_4h,
+                feature_names_4h,
+                norm_types_4h,  # <<< MỚI
+            ) = results["4h"]
             if is_first_coin:
                 self.feature_names["4h"] = feature_names_4h
                 self.n_features["4h"] = len(feature_names_4h)
+                self.norm_types["4h"] = norm_types_4h  # <<< MỚI
 
-            # Tạo DF 4h cục bộ để merge
             df_4h_local = pd.DataFrame(
                 {
                     "date": dates_4h,
@@ -553,7 +625,6 @@ class CryptoDataModule(LightningDataModule):
                 }
             )
 
-            # Merge_asof để tìm nến 4h *đã đóng* gần nhất cho *mọi* mốc 1h
             aligned_4h = pd.merge_asof(
                 self.master_df,
                 df_4h_local,
@@ -561,7 +632,6 @@ class CryptoDataModule(LightningDataModule):
                 direction="backward",
             )
 
-            # Điền vào bản đồ
             valid_aligned_4h = aligned_4h.dropna()
             master_indices_4h = valid_aligned_4h["master_idx"].values
             local_indices_4h = valid_aligned_4h["local_idx_4h"].values.astype(np.int32)
@@ -575,10 +645,16 @@ class CryptoDataModule(LightningDataModule):
 
         # --- Xử lý 1D (Logic căn chỉnh mới) ---
         if "1d" in results:
-            dates_1d, features_array_1d, feature_names_1d = results["1d"]
+            (
+                dates_1d,
+                features_array_1d,
+                feature_names_1d,
+                norm_types_1d,  # <<< MỚI
+            ) = results["1d"]
             if is_first_coin:
                 self.feature_names["1d"] = feature_names_1d
                 self.n_features["1d"] = len(feature_names_1d)
+                self.norm_types["1d"] = norm_types_1d  # <<< MỚI
 
             df_1d_local = pd.DataFrame(
                 {
@@ -607,15 +683,14 @@ class CryptoDataModule(LightningDataModule):
 
     # --- Post-Processing Functions ---
 
-    # <<< MỚI: Viết lại hoàn toàn để kiểm tra 3 lookback
     def _calculate_validity_mask(self):
         """
         Cập nhật `mask_aligned` để chỉ bao gồm các mốc thời gian
-        có đủ lookback cho CẢ BA khung thời gian.
+        có đủ lookback cho CẢ BA khung thời gian. (Không thay đổi)
         """
         print("Calculating final validity mask across 1h, 4h, 1d...")
 
-        # 1. Kiểm tra 1H: Phải có dữ liệu 1h (mask_1h_raw) VÀ đủ lookback 1h
+        # 1. Kiểm tra 1H
         T_1h = self.hparams.lookback_window_1h
         mask_1h_raw = self._mask_1h_raw
         history_counts_1h = bn.move_sum(
@@ -627,12 +702,12 @@ class CryptoDataModule(LightningDataModule):
         valid_lookback_1h = history_counts_1h == T_1h
         final_mask_1h = mask_1h_raw & valid_lookback_1h
 
-        # 2. Kiểm tra 4H: Phải map tới một chỉ số 4h VÀ chỉ số đó >= (T_4h - 1)
+        # 2. Kiểm tra 4H
         T_4h = self.hparams.lookback_window_4h
         map_4h = self.master_to_local_map_aligned["4h"]
         final_mask_4h = map_4h >= (T_4h - 1)
 
-        # 3. Kiểm tra 1D: Phải map tới một chỉ số 1d VÀ chỉ số đó >= (T_1d - 1)
+        # 3. Kiểm tra 1D
         T_1d = self.hparams.lookback_window_1d
         map_1d = self.master_to_local_map_aligned["1d"]
         final_mask_1d = map_1d >= (T_1d - 1)
@@ -640,14 +715,11 @@ class CryptoDataModule(LightningDataModule):
         # Mask cuối cùng là AND của cả ba
         self.mask_aligned = final_mask_1h & final_mask_4h & final_mask_1d
 
-        # Giải phóng bộ nhớ mask 1h thô
         del self._mask_1h_raw
         gc.collect()
 
     def _calculate_coin_baselines(self):
-        """Calculates the positive trade rate (baseline) for each coin."""
-        # Logic này vẫn đúng vì nó dựa trên self.mask_aligned (đã được cập nhật)
-        # và self.train_indices
+        """Calculates the positive trade rate (baseline) for each coin. (Không thay đổi)"""
         print("Calculating coin baselines from training data...")
         if self.train_indices is None or len(self.train_indices) == 0:
             self.coin_baselines = {coin: 0.0 for coin in self.coins}
@@ -684,7 +756,6 @@ class CryptoDataModule(LightningDataModule):
         Finds all valid timestamp indices (>= P coins)
         and splits them into train/val sets. (Không thay đổi logic)
         """
-        # self.mask_aligned giờ đã là mask tổng hợp 1h+4h+1d
         valid_coins_per_timestamp = np.sum(self.mask_aligned, axis=0)
         valid_sample_mask = valid_coins_per_timestamp >= self.hparams.portfolio_size
         all_valid_sample_indices = np.where(valid_sample_mask)[0]
@@ -713,7 +784,6 @@ class CryptoDataModule(LightningDataModule):
                 "No validation samples found. Adjust `validation_start_date`."
             )
 
-        # Logic lặp lại (repeat) vẫn giữ nguyên
         n_valid_coins_at_train_indices = valid_coins_per_timestamp[unique_train_indices]
         n_repeats = np.ceil(
             n_valid_coins_at_train_indices / self.hparams.portfolio_size
@@ -722,7 +792,7 @@ class CryptoDataModule(LightningDataModule):
         self.train_indices = np.repeat(unique_train_indices, n_repeats)
 
     # --- Validation Coin Selection ---
-    # (Toàn bộ logic này không cần thay đổi vì nó hoạt động trên self.mask_aligned)
+    # (Toàn bộ logic này không cần thay đổi)
 
     def _find_validation_coins(self):
         """Orchestrates the selection of a fixed validation coin portfolio."""
@@ -745,7 +815,6 @@ class CryptoDataModule(LightningDataModule):
         )
 
     def _get_user_provided_val_coins(self, user_coins: List[str]) -> List[int]:
-        """Parses the user-provided list of coin names into indices."""
         coins_set = set(self.coins)
         coin_to_idx = {coin: idx for idx, coin in enumerate(self.coins)}
         existing_coins = [coin for coin in user_coins if coin in coins_set]
@@ -762,7 +831,6 @@ class CryptoDataModule(LightningDataModule):
         return selected_indices
 
     def _filter_val_coins_by_availability(self, coin_indices: List[int]) -> List[int]:
-        """Filters a list of coin indices, keeping only those valid across all val timestamps."""
         if len(self.val_indices) == 0:
             return coin_indices
         valid_indices = []
@@ -779,7 +847,6 @@ class CryptoDataModule(LightningDataModule):
     def _fill_or_truncate_val_coins(
         self, selected_indices: List[int], P: int
     ) -> List[int]:
-        """Ensures the list of indices has exactly P coins."""
         if len(selected_indices) < P:
             candidate_scores = {}
             for coin_idx in range(len(self.coins)):
@@ -814,19 +881,16 @@ class CryptoDataModule(LightningDataModule):
         return selected_indices
 
     def _get_auto_selected_val_coins(self, P: int) -> List[int]:
-        """Auto-selects the top P coins based on data availability."""
         valid_samples_per_coin = np.sum(self.mask_aligned, axis=1)
         top_p_coin_indices = np.argsort(valid_samples_per_coin)[-P:]
         return list(top_p_coin_indices)
 
     # --- Collate Function & DataLoaders ---
 
-    # <<< MỚI: Viết lại hoàn toàn để lắp ráp 3 tensor đặc trưng
     def _create_collator(self, is_train: bool):
         """
-        Factory tạo ra collate_fn cho 3 khung thời gian.
+        Factory tạo ra collate_fn cho 3 khung thời gian. (Không thay đổi)
         """
-        # Lấy kích thước từ hparams và state
         T_1h = self.hparams.lookback_window_1h
         T_4h = self.hparams.lookback_window_4h
         T_1d = self.hparams.lookback_window_1d
@@ -838,7 +902,6 @@ class CryptoDataModule(LightningDataModule):
         def collate_fn(batch_timestamp_indices: List[int]) -> Dict[str, torch.Tensor]:
             B = len(batch_timestamp_indices)
 
-            # Khởi tạo các mảng trống cho 3 khung thời gian
             batch_features_1h = np.empty((B, P, T_1h, F_1h), dtype=np.float32)
             batch_features_4h = np.empty((B, P, T_4h, F_4h), dtype=np.float32)
             batch_features_1d = np.empty((B, P, T_1d, F_1d), dtype=np.float32)
@@ -849,7 +912,6 @@ class CryptoDataModule(LightningDataModule):
 
             for i, ts_idx in enumerate(batch_timestamp_indices):
                 if is_train:
-                    # mask_aligned đã là mask tổng hợp, nên logic này vẫn đúng
                     valid_coin_indices = np.where(self.mask_aligned[:, ts_idx])[0]
                     coin_indices = np.random.choice(
                         valid_coin_indices, P, replace=False
@@ -858,7 +920,6 @@ class CryptoDataModule(LightningDataModule):
                 else:
                     coin_indices = self.val_coin_indices
 
-                # Nhãn và coin_ids (như cũ, vì chúng dựa trên 1h)
                 list_labels_trade.append(
                     self.all_labels_trade_aligned[coin_indices, ts_idx]
                 )
@@ -867,52 +928,41 @@ class CryptoDataModule(LightningDataModule):
                 )
                 list_coin_ids.append(coin_indices)
 
-                # Lắp ráp đặc trưng cho từng coin trong danh mục
                 for p_idx, coin_idx in enumerate(coin_indices):
                     # --- 1. Lấy dữ liệu 1H ---
-                    # Tạo dải chỉ số 1h trong không gian master
                     master_idx_range_1h = np.arange(ts_idx - T_1h + 1, ts_idx + 1)
-                    # Map về chỉ số 1h cục bộ
                     local_indices_1h = self.master_to_local_map_aligned["1h"][
                         coin_idx, master_idx_range_1h
                     ]
-                    # Cắt lát
                     features_slice_1h = self.features_per_coin["1h"][coin_idx][
                         local_indices_1h, :
                     ]
                     batch_features_1h[i, p_idx, :, :] = features_slice_1h
 
                     # --- 2. Lấy dữ liệu 4H ---
-                    # Lấy chỉ số 4h cục bộ *hiện tại* (đã đóng)
                     current_local_idx_4h = self.master_to_local_map_aligned["4h"][
                         coin_idx, ts_idx
                     ]
-                    # Tạo dải chỉ số 4h trong không gian *cục bộ 4h*
                     local_indices_4h = np.arange(
                         current_local_idx_4h - T_4h + 1, current_local_idx_4h + 1
                     )
-                    # Cắt lát
                     features_slice_4h = self.features_per_coin["4h"][coin_idx][
                         local_indices_4h, :
                     ]
                     batch_features_4h[i, p_idx, :, :] = features_slice_4h
 
                     # --- 3. Lấy dữ liệu 1D ---
-                    # Lấy chỉ số 1d cục bộ *hiện tại* (đã đóng)
                     current_local_idx_1d = self.master_to_local_map_aligned["1d"][
                         coin_idx, ts_idx
                     ]
-                    # Tạo dải chỉ số 1d trong không gian *cục bộ 1d*
                     local_indices_1d = np.arange(
                         current_local_idx_1d - T_1d + 1, current_local_idx_1d + 1
                     )
-                    # Cắt lát
                     features_slice_1d = self.features_per_coin["1d"][coin_idx][
                         local_indices_1d, :
                     ]
                     batch_features_1d[i, p_idx, :, :] = features_slice_1d
 
-            # <<< MỚI: Trả về 3 tensor đặc trưng
             return {
                 "features_1h": torch.from_numpy(batch_features_1h),
                 "features_4h": torch.from_numpy(batch_features_4h),
@@ -933,7 +983,7 @@ class CryptoDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=True,
             drop_last=True,
-            collate_fn=self._create_collator(is_train=True),  # <<< MỚI
+            collate_fn=self._create_collator(is_train=True),
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -945,7 +995,7 @@ class CryptoDataModule(LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=True,
             drop_last=True,
-            collate_fn=self._create_collator(is_train=False),  # <<< MỚI
+            collate_fn=self._create_collator(is_train=False),
         )
 
     def test_dataloader(self) -> DataLoader:

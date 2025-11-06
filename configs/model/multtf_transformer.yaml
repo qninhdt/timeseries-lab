@@ -9,10 +9,8 @@ model:
   d_model: 64
   n_head: 4
   n_context_encoder_layers: 2
-  n_raw_encoder_layers: 2
   n_cross_layers: 1
   dim_feedforward: 128
   max_len: 64
   dropout: 0.1
   context_embed_dim: 16
-  raw_window_1h: 16

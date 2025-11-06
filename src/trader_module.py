@@ -13,7 +13,7 @@ from torchmetrics.classification import (
     PrecisionRecallCurve,
 )
 
-from layers import Normalize
+from layers import Normalize  # <<< Sử dụng Normalize đã sửa
 from utils.augmentation import apply_augmentation
 
 import wandb
@@ -44,22 +44,19 @@ class TraderLitModule(LightningModule):
             use_weighted_loss (bool): Enable coin-specific weighted loss for training
         """
         super().__init__()
-        # save_hyperparameters sẽ tự động lấy use_weighted_loss
         self.save_hyperparameters(logger=False, ignore=["model"])
 
-        # Model will be instantiated in setup() after we have access to datamodule
         self.model_class = model
         self.model = None
 
-        # Normalization module will be initialized in setup()
-        self.normalize_1h = None
-        self.normalize_4h = None
-        self.normalize_1d = None
+        # <<< MỚI: Đổi tên normalize_1h -> normalize (chỉ cần 1 module)
+        self.normalize = None
 
         # Buffer để lưu trọng số loss, sẽ được khởi tạo trong setup()
         self.register_buffer("coin_pos_weights", None)
 
         # Store boolean mask for features normalized with close (norm_type=2)
+        # Sẽ được tạo trong setup()
         self.close_norm_mask = None
 
         # --- Metrics for Training (Binary Classification) ---
@@ -86,17 +83,7 @@ class TraderLitModule(LightningModule):
     ) -> torch.Tensor:
         """
         Forward pass with multi-timeframe support.
-
-        Args:
-            x_1h: (B, P, T_1h, D_1h) - 1h timeframe features
-            x_4h: (B, P, T_4h, D_4h) - 4h timeframe features
-            x_1d: (B, P, T_1d, D_1d) - 1d timeframe features
-            coin_ids: (B, P) - coin indices
-            apply_augmentation: bool - whether to apply augmentation
-            **kwargs: Additional parameters (ignored)
-
-        Returns:
-            Logits: (B, P, 1) or (B, P)
+        (Không thay đổi logic ở đây)
         """
         B, P, T_1h, D_1h = x_1h.shape
         _, _, T_4h, D_4h = x_4h.shape
@@ -108,12 +95,14 @@ class TraderLitModule(LightningModule):
         x_1d_reshaped = x_1d.reshape(B * P, T_1d, D_1d)
 
         # Normalize all three timeframes together
+        # <<< MỚI: self.normalize giờ đây xử lý cả 3
         x_1h_norm, x_4h_norm, x_1d_norm = self.normalize(
             x_1h_reshaped, x_4h_reshaped, x_1d_reshaped, mode="norm"
         )
 
         # Apply augmentation after normalization if in training mode
         if apply_augmentation and self.hparams.use_augmentation and self.training:
+            # Chỉ augment 1h
             x_1h_norm = self._apply_augmentation(x_1h_norm)
 
         # Reshape back: (B*P, T, D) -> (B, P, T, D)
@@ -126,18 +115,13 @@ class TraderLitModule(LightningModule):
     def _apply_augmentation(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply augmentation only to features that are normalized with close (norm_type=2).
-        x shape: (B*P, T, D)
-        Uses PyTorch operations directly on GPU without CPU conversion.
+        x shape: (B*P, T, D_1h)
 
-        Only applies 2 augmentations:
-        - jitter: add Gaussian noise
-        - scaling: multiply by random factors
+        (Không thay đổi logic ở đây)
         """
-        # Apply augmentation with feature mask
-        # feature_mask is boolean tensor indicating which features to augment
         x_aug = apply_augmentation(
             x,
-            feature_mask=self.close_norm_mask,
+            feature_mask=self.close_norm_mask,  # Mask này đã được tạo trong setup()
             jitter_prob=self.hparams.aug_jitter_prob,
             scaling_prob=self.hparams.aug_scaling_prob,
             jitter_sigma=0.1,
@@ -147,6 +131,7 @@ class TraderLitModule(LightningModule):
         return x_aug
 
     def on_train_start(self) -> None:
+        # (Không thay đổi)
         self.val_loss.reset()
         self.val_trade_acc.reset()
         self.val_trade_ap.reset()
@@ -156,11 +141,12 @@ class TraderLitModule(LightningModule):
     def model_step(
         self, batch: Dict[str, torch.Tensor], apply_augmentation: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        features_1h = batch["features_1h"]  # (B, P, T, D)
-        features_4h = batch["features_4h"]  # (B, P, T, D)
-        features_1d = batch["features_1d"]  # (B, P, T, D)
-        targets = batch["labels_trade"]  # (B, P), bool type
-        coin_ids = batch.get("coin_ids", None)  # (B, P), coin indices
+        # (Không thay đổi)
+        features_1h = batch["features_1h"]
+        features_4h = batch["features_4h"]
+        features_1d = batch["features_1d"]
+        targets = batch["labels_trade"]
+        coin_ids = batch["coin_ids"]
 
         logits = self.forward(
             features_1h,
@@ -168,37 +154,30 @@ class TraderLitModule(LightningModule):
             features_1d,
             coin_ids,
             apply_augmentation=apply_augmentation,
-        )  # (B, P, 1)
-        logits = logits.squeeze(-1)  # (B, P)
+        )
+        logits = logits.squeeze(-1)
 
         targets_float = targets.float()
 
-        # Calculate loss
-        if self.hparams.use_weighted_loss and self.training and coin_ids is not None:
-            # self.coin_pos_weights có shape (C_total)
-            # coin_ids có shape (B, P)
-            # Lấy ra các trọng số tương ứng cho batch này
-            batch_pos_weights = self.coin_pos_weights[coin_ids]  # Shape (B, P)
-
+        if self.hparams.use_weighted_loss and self.coin_pos_weights is not None:
+            batch_pos_weights = self.coin_pos_weights[coin_ids]
             loss = nn.functional.binary_cross_entropy_with_logits(
                 logits, targets_float, pos_weight=batch_pos_weights
             )
         else:
-            # Loss BCE không trọng số (dùng cho validation hoặc khi tắt weighted_loss)
             loss = nn.functional.binary_cross_entropy_with_logits(logits, targets_float)
 
-        # Get probabilities and binary predictions for metrics
-        probs = torch.sigmoid(logits)  # (B, P)
-        preds = (probs > 0.5).float()  # (B, P)
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
 
         return loss, preds, probs, targets
 
     def training_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
+        # (Không thay đổi)
         loss, preds, probs, targets = self.model_step(batch, apply_augmentation=True)
 
-        # Update and log metrics
         self.train_loss(loss)
         self.train_trade_acc(preds, targets)
         self.train_trade_ap(probs, targets)
@@ -235,16 +214,14 @@ class TraderLitModule(LightningModule):
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        # model_step sẽ tự động dùng loss không trọng số vì self.training là False
+        # (Không thay đổi)
         loss, preds, probs, targets = self.model_step(batch, apply_augmentation=False)
 
-        # Update metrics
         self.val_loss(loss)
         self.val_trade_acc(preds, targets)
         self.val_trade_ap(probs, targets)
         self.val_pr_curve.update(probs, targets)
 
-        # Store probs for histogram logging
         self.val_epoch_outputs.append((probs.detach(), targets.detach()))
 
         self.log(
@@ -270,10 +247,9 @@ class TraderLitModule(LightningModule):
         )
 
     def on_validation_epoch_end(self) -> None:
-        # 1. Tính toán PR curve tổng hợp (metric cũ)
+        # (Không thay đổi)
         precisions, recalls, thresholds = self.val_pr_curve.compute()
 
-        # 2. Kiểm tra nếu không phải sanity check và có logger
         if not self.trainer.sanity_checking and self.logger is not None:
             loggers = self.logger if isinstance(self.logger, list) else [self.logger]
             wandb_logger = None
@@ -283,8 +259,6 @@ class TraderLitModule(LightningModule):
                     break
 
             if wandb_logger is not None:
-
-                # --- A. Xử lý PR Curve (Logic cũ) ---
                 log_payload = {}
                 precisions_np = precisions.cpu().numpy()
                 recalls_np = recalls.cpu().numpy()
@@ -299,34 +273,27 @@ class TraderLitModule(LightningModule):
                     pr_table, "Recall", "Precision", title="PR Curve"
                 )
 
-                # --- B. Xử lý Histogram & Bảng AP ---
                 if not self.val_epoch_outputs:
-                    # Nếu không có output, chỉ log PR curve
                     wandb_logger.experiment.log(log_payload)
                     self.val_pr_curve.reset()
                     return
 
-                # Tổng hợp tất cả outputs từ các validation step
                 all_probs = torch.cat(
                     [item[0] for item in self.val_epoch_outputs], dim=0
-                )  # (N_samples, P_coins)
+                )
                 all_targets = torch.cat(
                     [item[1] for item in self.val_epoch_outputs], dim=0
-                )  # (N_samples, P_coins)
+                )
 
-                # Xóa danh sách cho epoch tiếp theo
                 self.val_epoch_outputs.clear()
 
-                # Log histogram
                 all_probs_flat = all_probs.cpu().numpy().flatten()
                 log_payload["val/prob_distribution"] = wandb.Histogram(all_probs_flat)
 
-                # --- LOGIC MỚI: TẠO BẢNG AP (MODEL vs BASELINE) ---
                 datamodule = self.trainer.datamodule
-
                 num_coins = all_probs.shape[1]
-                coin_baselines = datamodule.coin_baselines  # Dict[str, float]
-                val_coin_names = datamodule.val_coin_names  # List of coin names
+                coin_baselines = datamodule.coin_baselines
+                val_coin_names = datamodule.val_coin_names
 
                 per_coin_ap_metric = BinaryAveragePrecision().to(self.device)
                 ap_table_data = []
@@ -336,34 +303,26 @@ class TraderLitModule(LightningModule):
                     coin_probs = all_probs[:, i]
                     coin_targets = all_targets[:, i]
 
-                    # 1. Tính Model AP
                     model_ap = per_coin_ap_metric(coin_probs, coin_targets.int()).item()
                     per_coin_ap_metric.reset()
 
-                    # 2. Lấy Baseline AP (từ datamodule)
                     baseline_ap = coin_baselines.get(coin_name, 0.0)
 
-                    # 3. Tính Lift
                     lift = model_ap / baseline_ap if baseline_ap > 0 else 0.0
                     lift_str = f"{lift:.2f}x"
 
                     ap_table_data.append([coin_name, model_ap, baseline_ap, lift_str])
 
-                # Sắp xếp bảng theo Model AP giảm dần
                 ap_table_data.sort(key=lambda x: x[1], reverse=True)
 
-                # Tạo bảng wandb với các cột mới
                 ap_table = wandb.Table(
                     data=ap_table_data,
                     columns=["Coin", "AP", "Baseline AP", "Lift"],
                 )
                 log_payload["val/trade_ap_table"] = ap_table
-                # --- KẾT THÚC LOGIC MỚI ---
 
-                # Log tất cả lên wandb
                 wandb_logger.experiment.log(log_payload)
 
-        # Reset metric tổng hợp cho epoch tiếp theo
         self.val_pr_curve.reset()
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
@@ -373,14 +332,14 @@ class TraderLitModule(LightningModule):
         pass
 
     def setup(self, stage: str) -> None:
-        # Lấy datamodule
+        """
+        <<< MỚI: Hàm setup đã được dọn dẹp.
+        """
         datamodule = self.trainer.datamodule
 
-        # Instantiate model with correct max_coins from datamodule
+        # Instantiate model (Không thay đổi)
         if self.model is None:
             max_coins = len(datamodule.coins)
-
-            # Get feature counts for each timeframe
             n_features_1h = datamodule.n_features["1h"]
             n_features_4h = datamodule.n_features["4h"]
             n_features_1d = datamodule.n_features["1d"]
@@ -392,81 +351,69 @@ class TraderLitModule(LightningModule):
                 max_coins=max_coins,
             )
 
-        # Calculate coin-specific positive weights for loss
+        # Calculate coin-specific positive weights for loss (Không thay đổi)
         if self.hparams.use_weighted_loss and self.coin_pos_weights is None:
             print("Calculating coin-specific positive weights for loss...")
-
             all_coin_names = datamodule.coins
             baselines = datamodule.coin_baselines
             n_coins = len(all_coin_names)
-
-            # Khởi tạo tensor trọng số
             pos_weights = torch.ones(n_coins, dtype=torch.float32)
 
             for i, coin_name in enumerate(all_coin_names):
-                # Lấy tỉ lệ positive (baseline)
                 p = baselines[coin_name]
-
-                # Tính trọng số = (1-p) / p
-                # Thêm epsilon để đảm bảo ổn định số học
                 epsilon = 1e-6
                 p_stable = np.clip(p, epsilon, 1.0 - epsilon)
                 pos_weights[i] = (1.0 - p_stable) / p_stable
 
-            # Đăng ký làm buffer để tự động chuyển sang device (GPU/CPU)
             self.register_buffer("coin_pos_weights", pos_weights)
             print(
                 f"Coin weights calculated and registered. Min: {pos_weights.min():.2f}, Max: {pos_weights.max():.2f}, Mean: {pos_weights.mean():.2f}"
             )
 
-        # Initialize normalization module
-        # Get feature names from datamodule (use 1h features for normalization config)
-        feature_names = datamodule.feature_names["1h"]
+        # <<< MỚI: Khởi tạo Normalization module ---
 
-        # Determine norm_types based on feature names
-        # Price features (open, high, low, close, volume) use norm_type=2 (close stats)
-        # Other features use norm_type=1 (own stats)
-        price_feature_names = ["open", "high", "low", "close", "volume"]
-        norm_types = []
-        for name in feature_names:
-            if name in price_feature_names:
-                norm_types.append(2)  # Use close stats for price features
-            else:
-                norm_types.append(1)  # Use own stats for other features
+        # 1. Lấy tất cả thông tin cần thiết từ datamodule
+        n_features_1h = datamodule.n_features["1h"]
+        n_features_4h = datamodule.n_features["4h"]
+        n_features_1d = datamodule.n_features["1d"]
 
-        # Find close index
-        close_idx = feature_names.index("close")
+        norm_types_1h = datamodule.norm_types["1h"]
+        norm_types_4h = datamodule.norm_types["4h"]
+        norm_types_1d = datamodule.norm_types["1d"]
 
-        # Identify price feature indices
-        price_feature_indices = []
-        for name in price_feature_names:
-            if name in feature_names:
-                price_feature_indices.append(feature_names.index(name))
+        close_idx_1h = datamodule.close_idx_1h
 
-        n_features = len(feature_names)
+        # 2. Khởi tạo module Normalize với đầy đủ thông tin
         self.normalize = Normalize(
-            num_features=n_features,
-            norm_types=norm_types,
-            close_idx=close_idx,
-            price_feature_indices=price_feature_indices,
-            affine=True,
+            num_features_1h=n_features_1h,
+            num_features_4h=n_features_4h,
+            num_features_1d=n_features_1d,
+            norm_types_1h=norm_types_1h,
+            norm_types_4h=norm_types_4h,
+            norm_types_1d=norm_types_1d,
+            close_idx_1h=close_idx_1h,
+            affine=True,  # Giữ affine=True
         )
-        # Create boolean mask for features normalized with close (norm_type=2)
-        # This will be used for selective augmentation
+
+        # 3. Tạo boolean mask cho augmentation (chỉ dựa trên 1h)
+        # Mask này dùng để augment các feature 1h có norm_type=2
         self.close_norm_mask = torch.tensor(
-            [norm_type == 2 for norm_type in norm_types],
+            [norm_type == 2 for norm_type in norm_types_1h],
             dtype=torch.bool,
             device=self.device,
         )
         n_close_norm = self.close_norm_mask.sum().item()
         print(
-            f"Features normalized with close (will be augmented): {n_close_norm}/{n_features}"
+            f"Features (1h) normalized with close (will be augmented): {n_close_norm}/{n_features_1h}"
         )
+
+        # --- Kết thúc khởi tạo Normalization ---
 
         if self.hparams.compile and stage == "fit":
             self.model = torch.compile(self.model)
 
     def configure_optimizers(self) -> Dict[str, Any]:
+        # (Không thay đổi)
         optimizer = torch.optim.AdamW(
             self.trainer.model.parameters(),
             lr=self.hparams.learning_rate,
