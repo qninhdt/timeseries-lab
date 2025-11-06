@@ -110,12 +110,26 @@ class TransformerEncoderLayerWithRMSNorm(nn.Module):
 
 
 class MultiTFTransformer(nn.Module):
+    """
+    Multi-timeframe transformer with cross-attention.
+
+    Input shapes:
+        h1: (B, T_1h, D_1h) or (B, P, T_1h, D_1h) - 1h timeframe features
+        h4: (B, T_4h, D_4h) or (B, P, T_4h, D_4h) - 4h timeframe features
+        d1: (B, T_1d, D_1d) or (B, P, T_1d, D_1d) - 1d timeframe features
+        coin_ids: (B,) or (B, P) - coin indices
+
+    Output shape:
+        (B, n_classes) if P=1 (standard case)
+        (B, P, n_classes) if P>1 (portfolio case)
+    """
+
     def __init__(
         self,
         n_features_1h: int,
         n_features_4h: int,
         n_features_1d: int,
-        n_classes: int = 1,
+        n_classes: int = 3,
         base_dim: int = 32,
         d_model: int = 256,
         n_head: int = 8,
@@ -216,19 +230,32 @@ class MultiTFTransformer(nn.Module):
     ) -> torch.Tensor:
         if h4 is None or d1 is None:
             raise ValueError("h4 and d1 must be provided for MultiTFTransformer")
-        B, P, T_1h, D_1h = h1.shape
-        _, _, T_4h, D_4h = h4.shape
-        _, _, T_1d, D_1d = d1.shape
+        if coin_ids is None:
+            raise ValueError(
+                "coin_ids must be provided for MultiTFTransformer with coin-specific cls tokens"
+            )
+
+        # Handle input shapes: (B, T, D) -> treat as (B, 1, T, D) internally
+        if h1.dim() == 3:
+            B, T_1h, D_1h = h1.shape
+            _, T_4h, D_4h = h4.shape
+            _, T_1d, D_1d = d1.shape
+            P = 1
+            h1 = h1.unsqueeze(1)  # (B, 1, T_1h, D_1h)
+            h4 = h4.unsqueeze(1)  # (B, 1, T_4h, D_4h)
+            d1 = d1.unsqueeze(1)  # (B, 1, T_1d, D_1d)
+            coin_ids = coin_ids.unsqueeze(1)  # (B, 1)
+        else:
+            B, P, T_1h, D_1h = h1.shape
+            _, _, T_4h, D_4h = h4.shape
+            _, _, T_1d, D_1d = d1.shape
+
         h1_flat = h1.reshape(B * P, T_1h, D_1h)
         h4_flat = h4.reshape(B * P, T_4h, D_4h)
         d1_flat = d1.reshape(B * P, T_1d, D_1d)
         batch_size_flat = B * P
 
         # Get coin-specific cls tokens using coin_ids
-        if coin_ids is None:
-            raise ValueError(
-                "coin_ids must be provided for MultiTFTransformer with coin-specific cls tokens"
-            )
         # Flatten coin_ids: (B, P) -> (B*P,)
         coin_ids_flat = coin_ids.reshape(-1)  # (B*P,)
         # Index into cls_token: (B*P,) -> (B*P, 1, d_model)
@@ -271,10 +298,14 @@ class MultiTFTransformer(nn.Module):
         h1_cls = h1_reps[:, 0, :]  # (B*P, d_model)
         context_d1_cls = context_d1[:, 0, :]  # (B*P, d_model)
         fused_reps = torch.cat([context_d1_cls, h1_cls], dim=1)
-        logits = self.classifier(fused_reps)
+        logits = self.classifier(fused_reps)  # (B*P, n_classes)
         n_classes = self.classifier[-1].out_features
-        if n_classes == 1:
-            logits = logits.reshape(B, P, 1)
+
+        # Reshape based on P dimension
+        if P == 1:
+            # Standard case: return (B, n_classes)
+            logits = logits.reshape(B, n_classes)
         else:
+            # Portfolio case: return (B, P, n_classes)
             logits = logits.reshape(B, P, n_classes)
         return logits

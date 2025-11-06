@@ -41,7 +41,7 @@ class PositionalEncoding(nn.Module):
 
 class CNNTransformer(nn.Module):
     """
-    A hybrid CNN-Transformer model for multi-timeframe portfolio data processing.
+    A hybrid CNN-Transformer model for multi-timeframe per-coin data processing.
 
     Architecture:
     1. Input projections for 3 timeframes (1h, 4h, 1d) to base_dim
@@ -54,13 +54,13 @@ class CNNTransformer(nn.Module):
     8. Classification head using CLS token output
 
     Input shapes:
-        h1: (B, P, T_1h, D_1h) - 1h timeframe features
-        h4: (B, P, T_4h, D_4h) - 4h timeframe features
-        d1: (B, P, T_1d, D_1d) - 1d timeframe features
-        coin_ids: (B, P) - coin indices
+        h1: (B, T_1h, D_1h) - 1h timeframe features
+        h4: (B, T_4h, D_4h) - 4h timeframe features
+        d1: (B, T_1d, D_1d) - 1d timeframe features
+        coin_ids: (B,) - coin indices
 
-    Output shape: (B, P, 1)
-        (Logits for binary 'trade' prediction for each coin)
+    Output shape: (B, 3)
+        (Logits for 3-class prediction: 0=hold, 1=buy, 2=sell)
     """
 
     def __init__(
@@ -149,8 +149,8 @@ class CNNTransformer(nn.Module):
             encoder_layers, num_layers=num_layers
         )
 
-        # Linear head to output a single logit per coin
-        self.head = nn.Linear(d_model, 1)
+        # Linear head to output 3-class logits per coin
+        self.head = nn.Linear(d_model, 3)
 
     def forward(
         self,
@@ -164,27 +164,27 @@ class CNNTransformer(nn.Module):
         Forward pass with multi-timeframe support.
 
         Args:
-            h1: Input tensor of shape (B, P, T_1h, D_1h) - 1h timeframe
-            h4: Input tensor of shape (B, P, T_4h, D_4h) - 4h timeframe
-            d1: Input tensor of shape (B, P, T_1d, D_1d) - 1d timeframe
-            coin_ids: Coin indices of shape (B, P) - required for coin embedding
+            h1: Input tensor of shape (B, T_1h, D_1h) - 1h timeframe
+            h4: Input tensor of shape (B, T_4h, D_4h) - 4h timeframe
+            d1: Input tensor of shape (B, T_1d, D_1d) - 1d timeframe
+            coin_ids: Coin indices of shape (B,) - required for coin embedding
 
         Returns:
-            logits: Output tensor of shape (B, P, 1)
+            logits: Output tensor of shape (B, 3)
         """
         if h4 is None or d1 is None:
             raise ValueError("h4 and d1 must be provided for CNNTransformer")
         if coin_ids is None:
             raise ValueError("coin_ids must be provided for CNNTransformer")
 
-        B, P, T_1h, D_1h = h1.shape
-        _, _, T_4h, D_4h = h4.shape
-        _, _, T_1d, D_1d = d1.shape
+        B, T_1h, D_1h = h1.shape
+        _, T_4h, D_4h = h4.shape
+        _, T_1d, D_1d = d1.shape
 
-        # Flatten B and P into a single batch dimension
-        h1_flat = h1.reshape(B * P, T_1h, D_1h)
-        h4_flat = h4.reshape(B * P, T_4h, D_4h)
-        d1_flat = d1.reshape(B * P, T_1d, D_1d)
+        # Per-coin batches are already (B, T, D)
+        h1_flat = h1
+        h4_flat = h4
+        d1_flat = d1
 
         # Project to base_dim before CNN
         h1_base = self.h1_input_proj(h1_flat)  # (B*P, T_1h, base_dim)
@@ -214,45 +214,41 @@ class CNNTransformer(nn.Module):
         # Add timeframe embeddings (like BERT segment embeddings)
         # Timeframe IDs: 0=1h, 1=4h, 2=1d
         tf_emb_1h = self.timeframe_embedding(
-            torch.zeros(B * P, T_1h_down, dtype=torch.long, device=h1.device)
-        )  # (B*P, T_1h', d_model)
+            torch.zeros(B, T_1h_down, dtype=torch.long, device=h1.device)
+        )  # (B, T_1h', d_model)
         tf_emb_4h = self.timeframe_embedding(
-            torch.ones(B * P, T_4h_down, dtype=torch.long, device=h4.device)
-        )  # (B*P, T_4h', d_model)
+            torch.ones(B, T_4h_down, dtype=torch.long, device=h4.device)
+        )  # (B, T_4h', d_model)
         tf_emb_1d = self.timeframe_embedding(
-            torch.full((B * P, T_1d_down), 2, dtype=torch.long, device=d1.device)
-        )  # (B*P, T_1d', d_model)
+            torch.full((B, T_1d_down), 2, dtype=torch.long, device=d1.device)
+        )  # (B, T_1d', d_model)
 
         h1_with_tf = h1_pos + tf_emb_1h
         h4_with_tf = h4_pos + tf_emb_4h
         d1_with_tf = d1_pos + tf_emb_1d
 
         # Concatenate all timeframes: [h1, h4, d1]
-        # Shape: (B*P, T_1h' + T_4h' + T_1d', d_model)
+        # Shape: (B, T_1h' + T_4h' + T_1d', d_model)
         all_tokens = torch.cat([h1_with_tf, h4_with_tf, d1_with_tf], dim=1)
 
         # Get coin embeddings
-        coin_ids_flat = coin_ids.reshape(B * P)  # (B*P,)
-        coin_emb = self.coin_embedding(coin_ids_flat)  # (B*P, d_model)
-        coin_token = coin_emb.unsqueeze(1)  # (B*P, 1, d_model)
+        coin_emb = self.coin_embedding(coin_ids)  # (B, d_model)
+        coin_token = coin_emb.unsqueeze(1)  # (B, 1, d_model)
 
         # Get CLS token
-        cls_tokens = self.cls_token.expand(B * P, -1, -1)  # (B*P, 1, d_model)
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, d_model)
 
         # Concatenate: [CLS, COIN_EMB, h1_tokens, h4_tokens, d1_tokens]
-        # Shape: (B*P, 1 + 1 + T_1h' + T_4h' + T_1d', d_model)
+        # Shape: (B, 1 + 1 + T_1h' + T_4h' + T_1d', d_model)
         x_with_special = torch.cat([cls_tokens, coin_token, all_tokens], dim=1)
 
         # Pass through transformer encoder
         x_transformed = self.transformer_encoder(x_with_special)
 
         # Take the output from the CLS token (first position)
-        cls_output = x_transformed[:, 0, :]  # (B*P, d_model)
+        cls_output = x_transformed[:, 0, :]  # (B, d_model)
 
         # Pass through the head to get logits
-        logits = self.head(cls_output)  # (B*P, 1)
+        logits = self.head(cls_output)  # (B, 3)
 
-        # Reshape back to (B, P, 1)
-        logits_out = logits.reshape(B, P, 1)
-
-        return logits_out
+        return logits

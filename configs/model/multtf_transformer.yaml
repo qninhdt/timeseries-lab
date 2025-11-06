@@ -4,7 +4,7 @@ defaults:
 model:
   _target_: models.multtf_transformer.MultiTFTransformer
   _partial_: true
-  n_classes: 1
+  n_classes: 3
   base_dim: 32
   d_model: 64
   n_head: 4
