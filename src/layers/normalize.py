@@ -219,4 +219,4 @@ class Normalize(nn.Module):
             # (Điều này đã được đảm bảo trong __init__)
             x_norm = x_norm * weight[:D] + bias[:D]
 
-        return torch.clamp(x_norm, -5.0, 5.0)
+        return torch.clamp(x_norm, -10.0, 10.0)

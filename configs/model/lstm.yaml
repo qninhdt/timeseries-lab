@@ -2,8 +2,9 @@ defaults:
   - default
 
 model:
-  _target_: models.simple_lstm.SimpleLSTM
+  _target_: models.lstm.LSTM
   _partial_: true
-  hidden_size: 128
+  hidden_size: 32
   num_layers: 2
-  dropout: 0.1
+  dropout: 0.2
+  bidirectional: false
