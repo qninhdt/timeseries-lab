@@ -4,9 +4,9 @@ end_date: 2025-09-29
 validation_start_date: 2025-01-01
 barrier_horizon: 4
 barrier_atr_multiplier: 1.0
-lookback_window_1h: 32
-lookback_window_4h: 32
-lookback_window_1d: 32
+lookback_window_1h: 64
+lookback_window_4h: 64
+lookback_window_1d: 64
 candle_length: 60000
 max_coins: 128
 batch_size: 2048

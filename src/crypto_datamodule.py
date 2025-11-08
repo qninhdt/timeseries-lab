@@ -163,6 +163,8 @@ class CryptoDataModule(LightningDataModule):
         # Lưu ý: pipeline huấn luyện dùng nhị phân trade/dir; multi có thể giữ cho mục đích khác
         self.all_labels_multi_aligned: np.ndarray = None
         self.mask_aligned: np.ndarray = None
+        # <<< MỚI: Lưu trữ close prices cho profit calculation
+        self.all_close_prices_aligned: np.ndarray = None
 
         self.features_per_coin: Dict[str, List[np.ndarray]] = {
             "1h": [],
@@ -241,6 +243,10 @@ class CryptoDataModule(LightningDataModule):
         # <<< MỚI: Khởi tạo mảng cho nhãn 3-class (kiểu int, default=0 (hold))
         self.all_labels_multi_aligned = np.full(
             (n_coins, n_timestamps), 0, dtype=np.int64
+        )
+        # <<< MỚI: Khởi tạo mảng cho close prices
+        self.all_close_prices_aligned = np.full(
+            (n_coins, n_timestamps), np.nan, dtype=np.float32
         )
         self._mask_1h_raw = np.full((n_coins, n_timestamps), False, dtype=np.bool_)
 
@@ -336,10 +342,11 @@ class CryptoDataModule(LightningDataModule):
 
     def _calculate_features(
         self, df_in: pd.DataFrame, timeframe: str
-    ) -> Tuple[pd.DataFrame, np.ndarray, List[str], List[int]]:
+    ) -> Tuple[pd.DataFrame, np.ndarray, List[str], List[int], Optional[np.ndarray]]:
         """
         Tính toán các chỉ báo kỹ thuật VÀ loại chuẩn hóa (norm_type) cho chúng.
         Labels (nhãn) CHỈ được tính cho khung 1h.
+        Returns: (df_out, features_array, feature_names, norm_types, close_prices)
         """
         df = df_in.copy()
         open_p = df["open"].values
@@ -481,10 +488,12 @@ class CryptoDataModule(LightningDataModule):
         feature_df = feature_df.ffill().bfill().fillna(0)
         features_array = feature_df.values.astype(np.float32)
 
+        # Return close prices for 1h timeframe
         if timeframe == "1h":
-            return df_out, features_array, feature_names, norm_types
+            close_prices = close_p.astype(np.float32)
+            return df_out, features_array, feature_names, norm_types, close_prices
         else:
-            return df_out, features_array, feature_names, norm_types
+            return df_out, features_array, feature_names, norm_types, None
 
     def _process_coin_numpy_optimized(self, df_raw: pd.DataFrame) -> Dict[str, Tuple]:
         """
@@ -498,9 +507,10 @@ class CryptoDataModule(LightningDataModule):
             features_1h,
             feature_names_1h,
             norm_types_1h,
+            close_prices_1h,
         ) = self._calculate_features(df_raw, "1h")
 
-        # <<< THAY ĐỔI: Trả về cả 3 loại nhãn
+        # <<< THAY ĐỔI: Trả về cả 3 loại nhãn + close prices
         results["1h"] = (
             df_1h.index.values,  # dates
             features_1h,
@@ -509,6 +519,7 @@ class CryptoDataModule(LightningDataModule):
             df_1h["label_multi"].values.astype(np.int64),  # Nhãn 3-class
             feature_names_1h,
             norm_types_1h,
+            close_prices_1h,  # Close prices
         )
 
         # 2. Resample và xử lý 4H
@@ -533,6 +544,7 @@ class CryptoDataModule(LightningDataModule):
                 features_4h,
                 feature_names_4h,
                 norm_types_4h,
+                _,
             ) = self._calculate_features(df_4h_raw, "4h")
             results["4h"] = (
                 df_4h.index.values,
@@ -555,6 +567,7 @@ class CryptoDataModule(LightningDataModule):
                 features_1d,
                 feature_names_1d,
                 norm_types_1d,
+                _,
             ) = self._calculate_features(df_1d_raw, "1d")
             results["1d"] = (
                 df_1d.index.values,
@@ -583,7 +596,7 @@ class CryptoDataModule(LightningDataModule):
         if "1h" not in results:
             return
 
-        # <<< THAY ĐỔI: Unpack 3 loại nhãn
+        # <<< THAY ĐỔI: Unpack 3 loại nhãn + close prices
         (
             dates_1h,
             features_array_1h,
@@ -592,6 +605,7 @@ class CryptoDataModule(LightningDataModule):
             labels_multi_array,  # Nhãn 3-class
             feature_names_1h,
             norm_types_1h,
+            close_prices_array,  # Close prices
         ) = results["1h"]
 
         # Logic is_first_coin (Không thay đổi)
@@ -616,7 +630,7 @@ class CryptoDataModule(LightningDataModule):
         valid_features_1h = features_array_1h[df_indices_1h].astype(np.float32)
         local_indices_for_map_1h = np.arange(len(df_indices_1h), dtype=np.int32)
 
-        # <<< THAY ĐỔI: Lưu trữ TẤT CẢ các nhãn
+        # <<< THAY ĐỔI: Lưu trữ TẤT CẢ các nhãn và close prices
         # Lưu nhãn nhị phân (để tính baseline)
         self.all_labels_trade_aligned[coin_idx, master_indices_1h] = labels_trade_array[
             df_indices_1h
@@ -626,6 +640,10 @@ class CryptoDataModule(LightningDataModule):
         ]
         # Lưu nhãn 3-class (cho model training)
         self.all_labels_multi_aligned[coin_idx, master_indices_1h] = labels_multi_array[
+            df_indices_1h
+        ]
+        # <<< MỚI: Lưu close prices
+        self.all_close_prices_aligned[coin_idx, master_indices_1h] = close_prices_array[
             df_indices_1h
         ]
 
@@ -899,9 +917,19 @@ class CryptoDataModule(LightningDataModule):
             batch_coin_idxs = batch_pairs_np[:, 0]
             batch_ts_idxs = batch_pairs_np[:, 1]
 
-            # <<< THAY ĐỔI: Lấy nhãn 3-class (0, 1, 2)
+            # <<< THAY ĐỔI: Lấy nhãn 3-class (0, 1, 2) và close prices
             labels_multi = self.all_labels_multi_aligned[batch_coin_idxs, batch_ts_idxs]
             coin_ids = batch_coin_idxs
+
+            # <<< MỚI: Lấy close_t và close_t+1
+            close_t = self.all_close_prices_aligned[batch_coin_idxs, batch_ts_idxs]
+            # Đảm bảo không vượt quá boundary
+            ts_idxs_next = np.minimum(
+                batch_ts_idxs + 1, len(self.master_timestamps) - 1
+            )
+            close_t_plus_1 = self.all_close_prices_aligned[
+                batch_coin_idxs, ts_idxs_next
+            ]
 
             current_local_idxs_4h = self.master_to_local_map_aligned["4h"][
                 batch_coin_idxs, batch_ts_idxs
@@ -931,14 +959,14 @@ class CryptoDataModule(LightningDataModule):
                 ]
 
             # 4. Convert to Tensor
-            labels_multi = self.all_labels_multi_aligned[batch_coin_idxs, batch_ts_idxs]
-
             return {
                 "features_1h": torch.from_numpy(batch_features_1h),
                 "features_4h": torch.from_numpy(batch_features_4h),
                 "features_1d": torch.from_numpy(batch_features_1d),
                 "labels": torch.from_numpy(labels_multi).long(),
                 "coin_ids": torch.from_numpy(coin_ids).long(),
+                "close_t": torch.from_numpy(close_t).float(),
+                "close_t_plus_1": torch.from_numpy(close_t_plus_1).float(),
             }
 
         return collate_fn

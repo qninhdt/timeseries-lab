@@ -1,0 +1,11 @@
+defaults:
+  - default
+
+model:
+  _target_: models.transformer.Transformer
+  _partial_: true
+  d_model: 32
+  nhead: 4
+  num_layers: 4
+  dim_feedforward: 128
+  dropout: 0.1

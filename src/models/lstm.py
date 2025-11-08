@@ -5,7 +5,8 @@ from typing import Optional
 
 class LSTM(nn.Module):
     """
-    LSTM model chỉ sử dụng timeframe 1h để dự đoán 3 lớp: hold, buy, sell.
+    LSTM model dự đoán 1 giá trị beta với tanh activation.
+    Beta trong khoảng [-1, 1]: -1 = sell, 0 = hold, 1 = buy
     """
 
     def __init__(
@@ -50,12 +51,13 @@ class LSTM(nn.Module):
         # Tính số chiều output của LSTM
         lstm_output_size = hidden_size * (2 if bidirectional else 1)
 
-        # Classification head: 3 classes (hold, buy, sell)
-        self.classifier = nn.Sequential(
+        # Regression head: 1 output with tanh
+        self.regressor = nn.Sequential(
             nn.Linear(lstm_output_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, 3),  # 3 classes: hold, buy, sell
+            nn.Linear(hidden_size, 1),  # Single output
+            nn.Tanh(),  # Squash to [-1, 1]
         )
 
     def forward(
@@ -76,7 +78,7 @@ class LSTM(nn.Module):
             coin_ids: Bỏ qua
 
         Returns:
-            logits: Tensor shape (B, 3) - logits cho 3 classes (hold, buy, sell)
+            beta: Tensor shape (B, 1) - trading signal in [-1, 1]
         """
         # Chỉ sử dụng x_1h
         # x_1h shape: (B, T_1h, D_1h)
@@ -85,7 +87,7 @@ class LSTM(nn.Module):
         # Lấy output tại timestep cuối cùng
         last_hidden = lstm_out[:, -1, :]  # (B, hidden_size * num_directions)
 
-        # Classification
-        logits = self.classifier(last_hidden)  # (B, 3)
+        # Regression with tanh
+        beta = self.regressor(last_hidden)  # (B, 1)
 
-        return logits
+        return beta

@@ -4,7 +4,7 @@ defaults:
 model:
   _target_: models.lstm.LSTM
   _partial_: true
-  hidden_size: 32
+  hidden_size: 64
   num_layers: 2
-  dropout: 0.2
+  dropout: 0.1
   bidirectional: false
